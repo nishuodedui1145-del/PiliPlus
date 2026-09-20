@@ -464,6 +464,23 @@ abstract final class RangeCore {
 abstract final class BtrLog {
   static final Map<String, int> _lastLogTimeMs = {};
 
+  /// 异常脱敏：把异常文本里的 http(s) 直链压成 host，防止带签名的 query 进日志。
+  /// 不能用 Uri.parse 兜底 —— 解析失败会退回原始串，等于没脱敏；这里只做纯文本截取，
+  /// 连 scheme 一起丢掉，保证输出里不可能残留 query。
+  static String redact(Object? e) {
+    if (e == null) return 'null';
+    return e.toString().replaceAllMapped(
+          RegExp(r'''[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s,)\]}"']+'''),
+          (m) {
+            final raw = m.group(0)!;
+            final rest = raw.substring(raw.indexOf('://') + 3);
+            final end = rest.indexOf(RegExp(r'[/?#]'));
+            final host = end >= 0 ? rest.substring(0, end) : rest;
+            return host.isEmpty ? '<url>' : host;
+          },
+        );
+  }
+
   /// 截断 URL 仅保留 host，严禁将包含签名的完整 URL 打印进日志
   static String hostOf(String url) {
     try {

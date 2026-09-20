@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:PiliPlus/services/btr_proxy/range_core.dart';
+
 /// CDN 竞速测量结果
 class CdnRaceResult {
   /// 选中的最优节点 host（只记 host，不记完整 URL）
@@ -110,7 +112,7 @@ class CdnRacer {
     this.maxParallel = 2,
     this.httpClient,
     void Function(String message)? logger,
-  }) : log = logger ?? print;
+  }) : log = logger ?? BtrLog.log;
 
   HttpClient get _client =>
       httpClient ??

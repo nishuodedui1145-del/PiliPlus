@@ -63,7 +63,7 @@ class SidxCache {
     } catch (e) {
       BtrLog.rateLimitedLog(
         'sidx_cache_url_fail',
-        '[BTR] [SidxCache] 解析 URL 失败: $e',
+        '[BTR] [SidxCache] 解析 URL 失败: ${BtrLog.redact(e)}',
       );
       return url;
     }

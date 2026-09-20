@@ -141,7 +141,7 @@ class BtrProxyServer {
           _handleRequest,
           onError: (err) {
             if (kDebugMode) {
-              debugPrint('BtrProxyServer error: $err');
+              debugPrint('BtrProxyServer error: ${BtrLog.redact(err)}');
             }
           },
         );
@@ -178,6 +178,7 @@ class BtrProxyServer {
             '[BTR] 代理停止跳过: 仍有在途请求 (${_activeTokens.length} 个)',
           );
         }
+        scheduleStop(delay: const Duration(seconds: 3));
         return;
       }
       final now = DateTime.now().millisecondsSinceEpoch;
@@ -187,6 +188,7 @@ class BtrProxyServer {
             '[BTR] 代理停止跳过: 最近 ${(now - _lastRequestTimestamp)}ms 内有活跃请求',
           );
         }
+        scheduleStop(delay: const Duration(seconds: 3));
         return;
       }
     }
@@ -220,7 +222,7 @@ class BtrProxyServer {
           await server.close(force: true);
         } catch (e) {
           if (kDebugMode) {
-            debugPrint('BtrProxyServer close error: $e');
+            debugPrint('BtrProxyServer close error: ${BtrLog.redact(e)}');
           }
         }
       } finally {
@@ -954,6 +956,7 @@ class BtrProxyServer {
             token: token,
             winningUrl: probe.winningUrl,
             concurrency: adaptiveConcurrency,
+            maxInFlightSockets: maxSockets,
             v1Bps: effectiveV1,
             originalThreads: allocatedThreads,
             onOrderedChunk: (chunk) async {
@@ -969,7 +972,9 @@ class BtrProxyServer {
         requestError = e;
         token.cancel(e);
         if (kDebugMode) {
-          debugPrint('[BTR] 响应已发送部分数据后检测到不支持 Range ($e)，中止连接');
+          debugPrint(
+            '[BTR] 响应已发送部分数据后检测到不支持 Range (${BtrLog.redact(e)})，中止连接',
+          );
         }
       } else {
         // 识别上游不支持/忽略 Range，标记降级直连（对齐官方 page-hook.js:1074-1081）
@@ -981,7 +986,7 @@ class BtrProxyServer {
         pool.singleConnectionSwitchCount++;
         if (kDebugMode) {
           debugPrint(
-            '[BTR] 上游不支持或忽略 Range ($e)，降级为单连接顺序透传: ${BtrLog.hostOf(targetUrl)}'
+            '[BTR] 上游不支持或忽略 Range (${BtrLog.redact(e)})，降级为单连接顺序透传: ${BtrLog.hostOf(targetUrl)}'
             '（本视频第 ${pool.singleConnectionSwitchCount} 次切单连接）',
           );
         }
@@ -1010,7 +1015,7 @@ class BtrProxyServer {
       requestError = e;
       token.cancel(e);
       if (kDebugMode) {
-        debugPrint('BtrProxyServer request error: $e');
+        debugPrint('BtrProxyServer request error: ${BtrLog.redact(e)}');
       }
       if (!bytesSent) {
         final statusCode = _extractStatusCode(e);
@@ -1026,7 +1031,7 @@ class BtrProxyServer {
       _activeTokens.remove(token);
       if (requestError != null && bytesSent) {
         if (kDebugMode) {
-          debugPrint('[BTR] 传输过程中出错，中止连接: $requestError');
+          debugPrint('[BTR] 传输过程中出错，中止连接: ${BtrLog.redact(requestError)}');
         }
         try {
           final socket = await request.response.detachSocket(writeHeaders: false);
@@ -1076,7 +1081,7 @@ class BtrProxyServer {
         }
       } catch (e) {
         if (kDebugMode) {
-          debugPrint('[BTR] CDN 竞速后台异常: $e');
+          debugPrint('[BTR] CDN 竞速后台异常: ${BtrLog.redact(e)}');
         }
       } finally {
         _inFlightRace = null;
@@ -1144,7 +1149,7 @@ class BtrProxyServer {
         // 预取失败绝不影响正常播放
         BtrLog.rateLimitedLog(
           'sidx_prefetch_err',
-          '[BTR] sidx 后台预取跳过: host=${BtrLog.hostOf(targetUrl)} ($e)',
+          '[BTR] sidx 后台预取跳过: host=${BtrLog.hostOf(targetUrl)} (${BtrLog.redact(e)})',
         );
       } finally {
         if (!success) {
@@ -1196,7 +1201,7 @@ class BtrProxyServer {
       return res;
     } catch (e) {
       if (kDebugMode) {
-        debugPrint('[BTR] 手动重新竞速失败: $e');
+        debugPrint('[BTR] 手动重新竞速失败: ${BtrLog.redact(e)}');
       }
       return null;
     }

@@ -169,4 +169,31 @@ void main() {
       );
     });
   });
+
+  group('BtrLog.redact 异常脱敏（发布前终审 A-2）', () {
+    test('异常文本里的带签名直链只保留 host，且不残留任何 query', () {
+      const signed =
+          'https://upos-sz-mirrorcosov.bilivideo.com/upgcxcode/a/b/c.m4s'
+          '?upsig=deadbeef&deadline=1789948080&hdnts=xyz';
+      const text =
+          'HttpException: Connection closed before full header was received, uri = $signed';
+      final out = BtrLog.redact(text);
+      expect(out.contains('upsig'), isFalse);
+      expect(out.contains('deadline'), isFalse);
+      expect(out.contains('hdnts'), isFalse);
+      expect(out.contains(RegExp(r'https?://')), isFalse);
+      expect(out.contains('upos-sz-mirrorcosov.bilivideo.com'), isTrue);
+    });
+
+    test('null / 引号包裹 / 无 scheme 的边界不崩且不泄漏', () {
+      expect(BtrLog.redact(null), equals('null'));
+      const quoted =
+          'FormatException: Invalid URI "https://x.bilivideo.com/p.m4s?upsig=1"';
+      final out = BtrLog.redact(quoted);
+      expect(out.contains('upsig'), isFalse);
+      expect(out.contains('x.bilivideo.com'), isTrue);
+      const plain = 'SocketException: Failed host lookup: upos-sz-mirrorcos.bilivideo.com';
+      expect(BtrLog.redact(plain), contains('upos-sz-mirrorcos.bilivideo.com'));
+    });
+  });
 }

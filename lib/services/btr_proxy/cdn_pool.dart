@@ -190,8 +190,13 @@ class CdnPool {
   CdnGroup _activeGroup = CdnGroup.mainland;
   CdnGroup get activeGroup => _activeGroup;
 
+  /// 分组是否已被「用户手动指定」或「探测后定组」决定。
+  /// auto 模式下探测完成前保持 false：此时锚点不做分组过滤（见 _withAnchor）。
+  bool _groupDecided = false;
+
   void selectGroup(CdnGroup group) {
     _activeGroup = group;
+    _groupDecided = true;
   }
 
   late final List<String> _mainlandCandidateUrls;
@@ -571,6 +576,10 @@ class CdnPool {
     this.videoBitrateBytesPerSec,
     this.preferredGroup,
   }) : banList = banList ?? CdnBanList() {
+    if (preferredGroup != null) {
+      _activeGroup = preferredGroup!;
+      _groupDecided = true;
+    }
     videoBitrateBytesPerSec ??= _extractBitrateBytesPerSec(originalUrls.isNotEmpty ? originalUrls.first : '');
     slowPieceThreshold = RangeCore.adaptiveSlowPieceThreshold(
       videoBitrateBytesPerSec,
@@ -831,6 +840,19 @@ class CdnPool {
     if (anchor == null || !isUsable(anchor) || list.contains(anchor)) {
       return list;
     }
+    // 锚点是 App 自己选的节点，用户指定分组（或探测后已定组）时不得让它穿透。
+    // 但 auto 模式下探测完成前 _activeGroup 仍是默认的大陆组，此时不过滤：
+    // 否则「探测失败 → 回退 pool.urls()」会丢掉 App 自己那条已知可用的 URL。
+    if (_groupDecided) {
+      final host = anchorHost;
+      final belongsToActiveGroup = host != null &&
+          (_activeGroup == CdnGroup.overseas
+              ? overseasHosts.contains(host)
+              : !overseasHosts.contains(host));
+      if (!belongsToActiveGroup) {
+        return list;
+      }
+    }
     if (availableOnly) {
       final now = DateTime.now().millisecondsSinceEpoch;
       if (_health[anchor]?.isBlocked(now) ?? false) {
@@ -1056,7 +1078,8 @@ class CdnPool {
     adaptiveConcurrency = null;
     _stickyUrl = null;
     hasSpeedTested = false;
-    _activeGroup = CdnGroup.mainland;
+    _activeGroup = preferredGroup ?? CdnGroup.mainland;
+    _groupDecided = preferredGroup != null;
     isSingleConnectionMode = false;
     lastSingleConnectionSpeedBps = 0.0;
     clearStickySingleConnection();

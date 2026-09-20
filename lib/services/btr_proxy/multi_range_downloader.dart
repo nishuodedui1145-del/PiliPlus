@@ -152,7 +152,11 @@ class PrioritySemaphore {
         _drain();
       }
 
-      entry.completer.complete(release);
+      if (entry.completer.isCompleted) {
+        release(); // 已在取消路径完成：只回收槽位，避免泄漏与死锁
+      } else {
+        entry.completer.complete(release);
+      }
     }
   }
 }
@@ -981,7 +985,7 @@ class MultiRangeDownloader {
       } catch (e) {
         if (e is UpstreamHttpException) rethrow;
         if (kDebugMode) {
-          debugPrint('[BTR] HEAD probe failed on ${BtrLog.hostOf(url)}: $e');
+          debugPrint('[BTR] HEAD probe failed on ${BtrLog.hostOf(url)}: ${BtrLog.redact(e)}');
         }
       } finally {
         token.removeListener(onCancel);
@@ -1304,6 +1308,7 @@ class MultiRangeDownloader {
     required CancellationToken token,
     required String winningUrl,
     required int concurrency,
+    int? maxInFlightSockets,
     double v1Bps = 0.0,
     int? originalThreads,
     required Future<void> Function(Uint8List chunk) onOrderedChunk,
@@ -1315,6 +1320,7 @@ class MultiRangeDownloader {
       token: token,
       winningUrl: winningUrl,
       concurrency: concurrency,
+      maxInFlightSockets: maxInFlightSockets ?? this.maxInFlightSockets,
       v1Bps: v1Bps,
       originalThreads: originalThreads,
       onOrderedChunk: onOrderedChunk,
@@ -1330,6 +1336,7 @@ class MultiRangeDownloader {
     required CancellationToken token,
     required Future<void> Function(Uint8List chunk) onOrderedChunk,
     int? concurrency,
+    int? maxInFlightSockets,
     int minChunkBytes = RangeCore.defaultMinChunkBytes,
     int maxPieceBytes = RangeCore.defaultMaxPieceBytes,
   }) async {
@@ -1375,6 +1382,7 @@ class MultiRangeDownloader {
       token: token,
       winningUrl: probe.winningUrl,
       concurrency: initialConcurrency,
+      maxInFlightSockets: maxInFlightSockets ?? this.maxInFlightSockets,
       v1Bps: probe.bps,
       originalThreads: effConcurrency,
       onOrderedChunk: onOrderedChunk,
@@ -1399,6 +1407,7 @@ class _SlidingWindowStreamer {
   final String winningUrl;
   final double v1Bps;
   final int originalThreads;
+  final int _maxSockets;
   int limit;
   final Future<void> Function(Uint8List chunk) onOrderedChunk;
 
@@ -1466,10 +1475,12 @@ class _SlidingWindowStreamer {
     required this.token,
     required this.winningUrl,
     required int concurrency,
+    int? maxInFlightSockets,
     this.v1Bps = 0.0,
     int? originalThreads,
     required this.onOrderedChunk,
-  })  : originalThreads = originalThreads ?? concurrency,
+  })  : _maxSockets = maxInFlightSockets ?? downloader.maxInFlightSockets,
+        originalThreads = originalThreads ?? concurrency,
         limit = (pool.adaptiveConcurrency ??
                 min(concurrency, RangeCore.maxRampConcurrency))
             .clamp(1, 512),
@@ -1506,7 +1517,8 @@ class _SlidingWindowStreamer {
     }
 
     _streamSw.start();
-    downloader.setConcurrency(limit);
+    downloader.setConcurrency(limit, maxInFlightSockets: _maxSockets);
+    pool.updateSlowPieceThreshold(concurrency: limit);
     if (!_evaluated && _sampleTarget > 0) {
       _sampleSw.start();
     }
@@ -1656,7 +1668,7 @@ class _SlidingWindowStreamer {
         pool.singleConnectionSwitchCount++;
         if (kDebugMode) {
           debugPrint(
-            '[BTR] 分块 #${failedPiece.index} 重试失败 ($cause)，'
+            '[BTR] 分块 #${failedPiece.index} 重试失败 (${BtrLog.redact(cause)})，'
             '降级为对该区间 bytes=${failedPiece.start}-$remainingEnd 的单连接顺序透传'
             '（本视频第 ${pool.singleConnectionSwitchCount} 次切单连接）',
           );
@@ -1846,7 +1858,10 @@ class _SlidingWindowStreamer {
               pool.adaptiveConcurrency = decidedConcurrency;
               if (decidedConcurrency != limit) {
                 limit = decidedConcurrency;
-                downloader.setConcurrency(decidedConcurrency);
+                downloader.setConcurrency(
+                  decidedConcurrency,
+                  maxInFlightSockets: _maxSockets,
+                );
               }
 
               pool.updateSlowPieceThreshold(
@@ -2124,6 +2139,7 @@ class _SlidingWindowStreamer {
                 token: token,
                 winningUrl: winningUrl,
                 concurrency: originalThreads,
+                maxInFlightSockets: _maxSockets,
                 v1Bps: 0.0,
                 originalThreads: originalThreads,
                 onOrderedChunk: onOrderedChunk,
@@ -2153,7 +2169,7 @@ class _SlidingWindowStreamer {
         lastError = e;
         if (token.isCancelled || e is UpstreamHttpException) rethrow;
         if (kDebugMode) {
-          debugPrint('[BTR] 降级单连接顺序透传尝试 ${attempt + 1} 失败: $e');
+          debugPrint('[BTR] 降级单连接顺序透传尝试 ${attempt + 1} 失败: ${BtrLog.redact(e)}');
         }
       } finally {
         token.removeListener(onCancel);
@@ -2163,7 +2179,7 @@ class _SlidingWindowStreamer {
 
     if (kDebugMode) {
       debugPrint(
-        '[BTR] 降级单连接顺序透传所有重试均失败: $lastError, 原因: 上游彻底不可用',
+        '[BTR] 降级单连接顺序透传所有重试均失败: ${BtrLog.redact(lastError)}, 原因: 上游彻底不可用',
       );
     }
     throw lastError ?? Exception('降级单连接顺序透传失败：上游彻底不可用');
