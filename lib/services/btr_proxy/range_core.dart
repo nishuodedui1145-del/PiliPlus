@@ -85,10 +85,21 @@ abstract final class RangeCore {
   static const int defaultMinChunkBytes = 64 * 1024; // 64 KiB
 
   /// 固定分块大小（默认 512 KiB）
-  /// ↑ 回退到第十一轮的值（真机对比：128KB 分块那次起播更慢、速率更差；
-  ///   官方虽然用 64~128KB，但那是在浏览器 MSE 层的形态，我们这里请求开销更贵）
-  /// 块大小与并发数完全解耦：块数 = ceil(区间长度 / maxPieceBytes)
-  /// 峰值内存上限 = concurrency × maxPieceBytes（例如 8 × 512 KiB = 4 MiB，32 × 512 KiB = 16 MiB）
+  /// ↑ 回退到第十一轮的值（真机 A/B：128 KiB 那次起播更慢、速率更差）
+  ///
+  /// 与官方的关系（`range-core.js:35` splitRange 的真实算法）：
+  ///   片数 = min(并发, ceil(区间长度 / minChunkBytes))，**片长 = 区间长度 / 片数**
+  /// 也就是说官方那个「64 KiB」只是**小片区间的下限**，不是标称片长：默认 8 线程、
+  /// 4 MiB 区间时官方片长 = 4 MiB / 8 = **512 KiB**，与我们一致。区间更大时官方片长会涨到
+  /// MB 级，我们固定在 512 KiB —— 这是**故意的**：片长与并发解耦，在途内存才有上界
+  /// （= 并发 × 片长），「慢块阈值 / hedge」这类按片标定的判据也才始终可用。
+  ///
+  /// 外部同类实现的取向同样指向"别切太小"：aria2 的 `--min-split-size` 默认 **20 MiB**
+  /// （官方解释是防止连接抖动），yt-dlp 教程推荐 `-k 1M`；HTTP/1.1 新连接要走 TCP 慢启动，
+  /// 64 KiB 这种小片在 40~80 ms RTT 的跨洋链路上基本被 RTT/建连开销吃掉。
+  ///
+  /// 块数 = ceil(区间长度 / maxPieceBytes)；峰值内存上限 = 并发 × maxPieceBytes
+  /// （例如 8 × 512 KiB = 4 MiB，32 × 512 KiB = 16 MiB）
   static const int defaultMaxPieceBytes = 512 * 1024; // 512 KiB
 
   /// 计算官方并发预算分配（对齐官方 idm-downloader.js:313-318 / 387-392）：
