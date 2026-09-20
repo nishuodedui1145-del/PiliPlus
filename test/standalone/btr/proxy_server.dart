@@ -5,31 +5,22 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'stubs.dart';
-import 'stubs.dart';
 import 'cdn_pool.dart';
 import 'cdn_racer.dart';
 import 'multi_range_downloader.dart';
 import 'range_core.dart';
 import 'sidx_parser.dart';
-import 'stubs.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
 
-/// 全局在途 Socket 预算协调器（对齐官方 idm-downloader.js:402-407）
+/// 全局在途 Socket 预算承载器（对齐官方 idm-downloader.js:402-407）
 ///
-/// 画面与声音分开预算，并设置跨请求的全局在途硬上限，避免画面把声音的连接占满。
+/// 分配由 [RangeCore.calculateBudget] 决定、各轨道信号量各自执行、两者之和 = 全局上限；
+/// 本类只承载分配结果。
+/// 注：跨轨道的动态再平衡（某轨道空闲时让出配额）未实现。
 class GlobalSocketBudget {
-  int _videoActive = 0;
-  int _audioActive = 0;
-  int _rescueActive = 0;
-
   int _videoLimit = 8;
   int _audioLimit = 2;
   int _rescueLimit = 1;
-
-  int get videoActive => _videoActive;
-  int get audioActive => _audioActive;
-  int get rescueActive => _rescueActive;
-  int get totalActive => _videoActive + _audioActive + _rescueActive;
 
   int get videoLimit => _videoLimit;
   int get audioLimit => _audioLimit;
@@ -44,9 +35,9 @@ class GlobalSocketBudget {
   }
 
   void reset() {
-    _videoActive = 0;
-    _audioActive = 0;
-    _rescueActive = 0;
+    _videoLimit = 8;
+    _audioLimit = 2;
+    _rescueLimit = 1;
   }
 }
 
@@ -67,6 +58,7 @@ class BtrProxyServer {
   Timer? _scheduledStopTimer;
   final GlobalSocketBudget socketBudget = GlobalSocketBudget();
   final Set<String> _inFlightSidxPrefetches = {};
+  final Map<String, int> _sidxPrefetchFailedExpiry = {};
   int _lastRequestTimestamp = 0;
 
   final CdnRacer racer = CdnRacer();
@@ -267,6 +259,8 @@ class BtrProxyServer {
     _rangeUnsupportedUrls.clear();
     _downloaderCache.clear();
     _totalLengthCache.clear();
+    SidxCache.clear();
+    _sidxPrefetchFailedExpiry.clear();
     _lastConfiguredConcurrency = null;
     socketBudget.reset();
     _inFlightSidxPrefetches.clear();
@@ -491,10 +485,15 @@ class BtrProxyServer {
       ..defaultHeaders = headers
       ..setConcurrency(initialConcurrency, maxInFlightSockets: maxSockets);
 
+    // P1-5: 重接管试探标记必须在 try 之前声明 —— 它要在 finally 里被读（复位 isRetakeoverInProgress），
+    //        声明在 try 内部的话 catch/finally 作用域看不到（Dart 作用域规则）。
+    var isRetakeoverAttempt = false;
     try {
       // 检查是否处于降级直连状态（对齐官方 page-hook.js:140-158 / 1074-1081）
       if (pool.isDirectPassthrough && request.method == 'GET') {
-        if (pool.checkRetakeoverEligible()) {
+        if (!pool.isRetakeoverInProgress && pool.checkRetakeoverEligible()) {
+          pool.isRetakeoverInProgress = true;
+          isRetakeoverAttempt = true;
           BtrLog.rateLimitedLog(
             'retakeover_attempt',
             '[BTR] 尝试重接管: host=${BtrLog.hostOf(targetUrl)} 第${pool.retakeoverAttempts}次/${RangeCore.retakeoverMaxAttempts}',
@@ -528,7 +527,7 @@ class BtrProxyServer {
           // 给它预取就是白扣海外带宽，还会跟正在下载的请求抢连接。
           final rangeHeader = request.headers.value(HttpHeaders.rangeHeader);
           final isStreamLike = rangeHeader == null ||
-              RegExp(r'^bytes=\d+-$').hasMatch(rangeHeader.trim());
+              RegExp(r'^bytes=\d+-$', caseSensitive: false).hasMatch(rangeHeader.trim());
           if (isStreamLike) {
             BtrLog.rateLimitedLog(
               'sidx_miss_$urlKey',
@@ -544,7 +543,8 @@ class BtrProxyServer {
       }
 
       // 任务 B：粘性单连接偏好命中（该视频多连接已判亏，直接单连接启动）
-      if (pool.hasStickySingleConnection && request.method == 'GET') {
+      // ⚠️ P1-5: 若本次请求正在尝试重接管，跳过粘性单连接拦截，允许真正走进多连接并发路径
+      if (!isRetakeoverAttempt && pool.hasStickySingleConnection && request.method == 'GET') {
         if (kDebugMode) {
           debugPrint(
             '[BTR] 粘性单连接命中（该视频多连接已判亏，直接单连接启动）: '
@@ -899,7 +899,7 @@ class BtrProxyServer {
       bytesSent = true;
 
       // 若处于重接管中且成功发送数据，恢复加速状态
-      if (pool.isDirectPassthrough) {
+      if (pool.isDirectPassthrough || isRetakeoverAttempt) {
         pool.onRetakeoverSuccess(BtrLog.hostOf(targetUrl));
       }
 
@@ -1019,6 +1019,9 @@ class BtrProxyServer {
         } catch (_) {}
       }
     } finally {
+      if (isRetakeoverAttempt) {
+        pool.isRetakeoverInProgress = false;
+      }
       // 统一唯一 close 责任处，彻底消除 double-close
       _activeTokens.remove(token);
       if (requestError != null && bytesSent) {
@@ -1087,12 +1090,18 @@ class BtrProxyServer {
     required CdnPool pool,
   }) {
     final urlKey = SidxCache.urlToKey(targetUrl);
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final failedExpiry = _sidxPrefetchFailedExpiry[urlKey];
+    if (failedExpiry != null && now < failedExpiry) {
+      return;
+    }
     if (SidxCache.get(urlKey) != null || _inFlightSidxPrefetches.contains(urlKey)) {
       return;
     }
     _inFlightSidxPrefetches.add(urlKey);
 
     unawaited(() async {
+      var success = false;
       try {
         final client = _getOrCreateHttpClient();
         final uri = Uri.parse(targetUrl);
@@ -1121,6 +1130,8 @@ class BtrProxyServer {
             final sidx = SidxParser.parseSidx(bytes, 0);
             if (sidx != null && sidx.segments.isNotEmpty) {
               SidxCache.put(urlKey, sidx);
+              _sidxPrefetchFailedExpiry.remove(urlKey);
+              success = true;
               BtrLog.log(
                 '[BTR] sidx 预取解析成功: host=${BtrLog.hostOf(targetUrl)}, 分段数=${sidx.segments.length}',
               );
@@ -1136,6 +1147,11 @@ class BtrProxyServer {
           '[BTR] sidx 后台预取跳过: host=${BtrLog.hostOf(targetUrl)} ($e)',
         );
       } finally {
+        if (!success) {
+          // P2-9: 记录 10 分钟负缓存，避免非 sidx 视频在每个 Range 请求反复白拉 256 KiB
+          _sidxPrefetchFailedExpiry[urlKey] =
+              DateTime.now().millisecondsSinceEpoch + 10 * 60 * 1000;
+        }
         _inFlightSidxPrefetches.remove(urlKey);
       }
     }());
@@ -1399,6 +1415,7 @@ class BtrProxyServer {
         ? (endOffset - fromOffset + 1)
         : null;
     var written = 0;
+    var earlyExit = false;
 
     try {
       upstreamReq = await client.openUrl(clientRequest.method, uri);
@@ -1406,7 +1423,11 @@ class BtrProxyServer {
         upstreamReq!.headers.set(k, v);
       });
       if (fromOffset != null) {
-        upstreamReq.headers.set(HttpHeaders.rangeHeader, 'bytes=$fromOffset-');
+        // P2-12: endOffset != null 时使用闭合 Range，避免上游连接无休止拉取
+        final rangeHeaderValue = (endOffset != null)
+            ? 'bytes=$fromOffset-$endOffset'
+            : 'bytes=$fromOffset-';
+        upstreamReq.headers.set(HttpHeaders.rangeHeader, rangeHeaderValue);
       } else {
         final clientRange = clientRequest.headers.value(HttpHeaders.rangeHeader);
         if (clientRange != null) {
@@ -1425,18 +1446,31 @@ class BtrProxyServer {
         var data = chunk;
         if (maxBytes != null) {
           final remaining = maxBytes - written;
-          if (remaining <= 0) break;
+          if (remaining <= 0) {
+            earlyExit = true;
+            break;
+          }
           if (data.length > remaining) {
             data = data.sublist(0, remaining);
+            earlyExit = true;
           }
         }
         clientRequest.response.add(data);
         await clientRequest.response.flush();
         written += data.length;
         onByteSent?.call();
+        if (earlyExit) {
+          break;
+        }
       }
     } finally {
       token.removeListener(onCancel);
+      if (earlyExit) {
+        // P2-12: 提前 break 时必须 abort 上游连接，防止后台继续漏水与占用连接池
+        try {
+          upstreamReq?.abort();
+        } catch (_) {}
+      }
       release?.call();
     }
   }

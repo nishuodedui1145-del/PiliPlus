@@ -20,7 +20,6 @@ OUT = os.path.join(ROOT, 'test', 'standalone', 'btr')
 
 STUBS = '''// 自动生成的最小桩：替换 PiliPlus app 侧的 BrowserUa / HttpString / Accounts。
 // 由 tool/make_btr_mirror.py 生成，不要手改。
-import 'dart:io';
 
 abstract final class BrowserUa {
   static const pc =
@@ -83,6 +82,18 @@ def main():
             r"import '\1';",
             text,
         )
+        # 去重：browser_ua / constants / accounts 三个 app 层 import 都映射到 stubs.dart，
+        # 直接替换会让生成物里出现三行 `import 'stubs.dart';`（触发 duplicate_import 警告）
+        seen_imports = set()
+        deduped = []
+        for line in text.split('\n'):
+            m = re.match(r"^import '([^']+)';$", line)
+            if m:
+                if m.group(1) in seen_imports:
+                    continue
+                seen_imports.add(m.group(1))
+            deduped.append(line)
+        text = '\n'.join(deduped)
         with open(os.path.join(OUT, name), 'w', encoding='utf-8') as f:
             f.write(text)
         print('mirrored', name)

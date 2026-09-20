@@ -8,13 +8,13 @@
 // 5. TTL：ttlMs 设 200ms，等 300ms 断言 isFresh == false、cached == null；
 // 6. 样本上限：断言整批下载字节数 ≤ maxCandidates × probeBytes。
 
-import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter_test/flutter_test.dart';
 
-import '../../lib/services/btr_proxy/cdn_racer.dart';
+// ⚠️ 必须引镜像目录（btr/），不能相对路径引 lib/：同名类会被加载两份，`is` 判断静默失效
+import 'btr/cdn_racer.dart';
 
 Future<HttpServer> createFakeCdnServer({
   required int delayMsPerChunk,
@@ -243,6 +243,7 @@ void main() {
       logger: (_) {},
     );
 
+    // ignore: cascade_invocations — 紧随其后的 expect(racer.xxx) 无法并入级联
     racer.cached = CdnRaceResult(
       host: 'ttl-test.bilivideo.com',
       bytesPerSec: 2.0 * 1024 * 1024,

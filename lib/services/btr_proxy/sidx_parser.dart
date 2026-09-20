@@ -190,19 +190,24 @@ abstract final class SidxParser {
 
           if (referencedSize == 0) return null;
 
-          if (referenceType == 0) {
-            segments.add(SidxSegment(
-              index: segments.length,
-              start: byteCursor,
-              end: byteCursor + referencedSize - 1,
-              length: referencedSize,
-              time: timeCursor,
-              duration: duration,
-              startTime: timeCursor / timescale,
-              endTime: (timeCursor + duration) / timescale,
-              durationSeconds: duration / timescale,
-            ));
+          // 防回归 P2-11: 分层 sidx（referenceType != 0）指向子 sidx box。
+          // 当前不递归加载子 sidx，宁可不用也不给残缺有空洞的分段表，
+          // 整个 parseSidx 直接返回 null 安全回退到等分切片。
+          if (referenceType != 0) {
+            return null;
           }
+
+          segments.add(SidxSegment(
+            index: segments.length,
+            start: byteCursor,
+            end: byteCursor + referencedSize - 1,
+            length: referencedSize,
+            time: timeCursor,
+            duration: duration,
+            startTime: timeCursor / timescale,
+            endTime: (timeCursor + duration) / timescale,
+            durationSeconds: duration / timescale,
+          ));
           byteCursor += referencedSize;
           timeCursor += duration;
         }

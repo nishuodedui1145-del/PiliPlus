@@ -38,6 +38,10 @@ class CdnBanList {
 
   CdnBanList({this.strikeLimit = 2});
 
+  /// 三级封禁语义定义（P0-3）：
+  /// 1. host: 整个域名（如 mirrorali.bilivideo.com）。当发生连接重置/连续超时等物理网络故障时封禁整个域名。
+  /// 2. address: 具体节点端点，组合为 "$host|$path"。当该节点对特定资源鉴权失败（403/404/410）时，只封禁此具体端点，同 path 的其它 host 镜像不受影响。
+  /// 3. pair: 需与 host 绑定的路径组合键（"$host|$path"），与 address 粒度对齐，用于配对失效记录。
   static String hostOf(String url) {
     try {
       return Uri.parse(url).host.toLowerCase();
@@ -49,17 +53,25 @@ class CdnBanList {
   static String addressOf(String url) {
     try {
       final uri = Uri.parse(url);
-      return uri.path.toLowerCase();
+      final host = uri.host.toLowerCase();
+      final path = uri.path.toLowerCase();
+      if (host.isEmpty || path.isEmpty) return '';
+      return '$host|$path';
     } catch (_) {
       return '';
     }
   }
 
   static String pairOf(String url) {
-    final h = hostOf(url);
-    final a = addressOf(url);
-    if (h.isEmpty || a.isEmpty) return '';
-    return '$h|$a';
+    try {
+      final uri = Uri.parse(url);
+      final host = uri.host.toLowerCase();
+      final path = uri.path.toLowerCase();
+      if (host.isEmpty || path.isEmpty) return '';
+      return '$host|$path';
+    } catch (_) {
+      return '';
+    }
   }
 
   /// 记录一次传输结果。若传输了 >0 字节，或为 Range 不支持降级，则不算作死节点
@@ -345,6 +357,9 @@ class CdnPool {
   /// 是否已判定加速不可行并降级为直连透传（对齐官方 page-hook.js:1074-1081 / 140-158）
   bool isDirectPassthrough = false;
 
+  /// 是否正在尝试重接管（P1-5: 用于跳过粘性单连接拦截并防止并发重入）
+  bool isRetakeoverInProgress = false;
+
   /// 重接管尝试次数（最多 3 次，4s / 8s / 16s，2 分钟窗口重置）
   int retakeoverAttempts = 0;
 
@@ -393,7 +408,12 @@ class CdnPool {
       return false;
     }
     if (now >= nextRetakeoverTimeMs) {
+      final currentAttempt = retakeoverAttempts;
       retakeoverAttempts++;
+      // P1-6 防回归：放行时立即推后下一次退避时间点，防止常规异常未调用 markDirectFallback 时被瞬间穿透打满
+      final delayMs = RangeCore.fallbackGraceMs +
+          RangeCore.retakeoverBaseDelayMs * (1 << min(currentAttempt, 2));
+      nextRetakeoverTimeMs = now + delayMs;
       return true;
     }
     return false;
@@ -402,9 +422,14 @@ class CdnPool {
   /// 标记重接管成功，恢复加速状态
   void onRetakeoverSuccess(String host) {
     isDirectPassthrough = false;
+    isRetakeoverInProgress = false;
     retakeoverAttempts = 0;
     fallbackWindowStartMs = 0;
-    BtrLog.log('[BTR] 重接管成功');
+    clearStickySingleConnection();
+    BtrLog.rateLimitedLog(
+      'retakeover_success',
+      '[BTR] 重接管成功: host=$host 恢复多连接并发加速',
+    );
   }
 
   /// 跨节点文件总长度一致性校验（对齐官方 idm-downloader.js:445-446）
@@ -412,7 +437,11 @@ class CdnPool {
   String? verifiedTotalHost;
 
   /// 校验从 [host] 收到的文件总长度 [total] 是否与已有记录一致。
-  /// 若不一致返回 false，并输出告警埋点；首次遇到或一致返回 true。
+  ///
+  /// 设计权衡（P0-4）：采用「先到先得 + 偏差节点被剔除」机制。
+  /// 首个通过 HTTP 206 状态码与 Range 校验的响应所带的 total 将确立为基准 (verifiedTotalLength)，
+  /// 基准一旦确立不许被后来的响应改写。若后续有节点返回微小偏差或异常 total，返回 false 并将
+  /// 该偏差节点计入 strike/排除，避免混拼不同总长来源导致 fMP4 花屏或播放器崩溃。
   bool checkTotalLengthConsistency(int total, String host) {
     if (verifiedTotalLength == null) {
       verifiedTotalLength = total;

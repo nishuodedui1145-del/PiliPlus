@@ -56,6 +56,16 @@ class CancellationException implements Exception {
   String toString() => 'CancellationException: $message';
 }
 
+/// 跨节点文件总长度不一致异常（节点级可重试错误，P0-4）
+class InconsistentTotalLengthException implements Exception {
+  final String message;
+  final Uri? uri;
+  const InconsistentTotalLengthException(this.message, {this.uri});
+
+  @override
+  String toString() => 'InconsistentTotalLengthException: $message';
+}
+
 /// 优先级的信号量，用于并发限流
 class PrioritySemaphore {
   int limit;
@@ -326,19 +336,6 @@ class MultiRangeDownloader {
         );
       }
 
-      // 跨节点文件总长度一致性校验（对齐官方 idm-downloader.js:445-446）
-      if (contentRange?.total != null) {
-        final total = contentRange!.total!;
-        final host = BtrLog.hostOf(url);
-        if (!pool.checkTotalLengthConsistency(total, host)) {
-          req.abort();
-          throw HttpException(
-            '跨节点文件总长度不一致: $host 返回 $total 与之前节点记录不符',
-            uri: Uri(scheme: uri.scheme, host: uri.host, path: uri.path),
-          );
-        }
-      }
-
       if (resp.statusCode < 200 || resp.statusCode >= 300) {
         throw UpstreamHttpException(
           resp.statusCode,
@@ -361,6 +358,22 @@ class MultiRangeDownloader {
           'Range 校验失败：HTTP ${resp.statusCode}, content-range: $contentRangeHeader, expect: ${piece.start}-${piece.end}',
           uri: Uri(scheme: uri.scheme, host: uri.host, path: uri.path),
         );
+      }
+
+      // 跨节点文件总长度一致性校验（对齐官方 idm-downloader.js:445-446）
+      // P0-4: 必须在 206 状态码与 Range 起止点校验通过之后才允许提取 total 作为基准或比对基准，
+      // 避免 416 等错误响应带有的 Content-Range 污染全局基准。
+      if (contentRange.total != null) {
+        final total = contentRange.total!;
+        final host = BtrLog.hostOf(url);
+        if (!pool.checkTotalLengthConsistency(total, host)) {
+          req.abort();
+          pool.banList.record(url, 0, InconsistentTotalLengthException('总长不一致: $total'));
+          throw InconsistentTotalLengthException(
+            '跨节点文件总长度不一致: $host 返回 $total 与基准 ${pool.verifiedTotalLength} 不符',
+            uri: Uri(scheme: uri.scheme, host: uri.host, path: uri.path),
+          );
+        }
       }
 
       final actualEnd = contentRange.end;
@@ -528,8 +541,8 @@ class MultiRangeDownloader {
     }
   }
 
-  /// 下载单个 piece，带 Hedge 双路竞速与重试机制
-  Future<PieceResult> downloadPiece({
+  /// 下载单个 piece 核心逻辑（带 Hedge 双路竞速与多候选重试）
+  Future<PieceResult> _downloadPieceInternal({
     required RangePiece piece,
     required CdnPool pool,
     required CancellationToken token,
@@ -599,6 +612,7 @@ class MultiRangeDownloader {
         candidatesList.add(first);
       }
 
+      final completer = Completer<PieceResult>();
       final token0 = CancellationToken();
       final token1 = CancellationToken();
       void onParentCancel() {
@@ -608,47 +622,40 @@ class MultiRangeDownloader {
 
       token.addListener(onParentCancel);
 
-      final slowThreshold = pool.slowPieceThreshold;
-      final pieceMaxTimeout = slowThreshold * 3;
-      Timer? pieceTimeoutTimer;
+      int activeCount = 0;
+      final errors = <Object>[];
       Timer? hedgeTimer;
+      Timer? pieceTimeoutTimer;
+      bool road2Started = false;
+
+      void checkAllDone() {
+        if (activeCount == 0 && !completer.isCompleted) {
+          final err = errors.isNotEmpty
+              ? errors.first
+              : Exception('两路竞速均未完成');
+          completer.completeError(err);
+        }
+      }
+
+      final slowThreshold = pool.slowPieceThreshold;
+      final pieceMaxTimeout = slowThreshold + RangeCore.attemptTimeout;
+
+      void armPieceTimeout(Duration timeout) {
+        pieceTimeoutTimer?.cancel();
+        pieceTimeoutTimer = Timer(timeout, () {
+          if (!completer.isCompleted) {
+            token0.cancel('分块传输总耗时超时 (${timeout.inMilliseconds}ms)');
+            token1.cancel('分块传输总耗时超时 (${timeout.inMilliseconds}ms)');
+          }
+        });
+      }
 
       try {
-        final completer = Completer<PieceResult>();
-        var activeCount = 0;
-        final errors = <Object>[];
-        bool road2Started = false;
-
-        void checkAllDone() {
-          if (activeCount == 0 && !completer.isCompleted) {
-            completer.completeError(
-              errors.isNotEmpty ? errors.last : Exception('没有可用 CDN 节点'),
-            );
-          }
-        }
-
-        void armPieceTimeout(Duration duration) {
-          pieceTimeoutTimer?.cancel();
-          pieceTimeoutTimer = Timer(duration, () {
-            if (!completer.isCompleted) {
-              token0.cancel('超过 ${(duration.inMilliseconds / 1000).toStringAsFixed(1)}s 未完成');
-              token1.cancel('超过 ${(duration.inMilliseconds / 1000).toStringAsFixed(1)}s 未完成');
-              completer.completeError(
-                TimeoutException(
-                  'piece #${piece.index} 超过 ${(duration.inMilliseconds / 1000).toStringAsFixed(1)}s 仍未完成',
-                ),
-              );
-            }
-          });
-        }
-
-        // 首字节前独立首字节超时生效（5.5s）；收到首字节后约束传输总耗时在自适应阈值内
         armPieceTimeout(RangeCore.firstByteTimeout + slowThreshold);
 
         void launchRoad2() {
           if (road2Started || completer.isCompleted || token.isCancelled) return;
           if (pair.length < 2) return;
-          road2Started = true;
 
           // 任务 A：只有当前聚合吞吐 < 目标吞吐（即真的喂不动）时，才允许对慢块发起第二路（hedge）；
           // 聚合已达标时，慢块只记日志、不抢路。
@@ -660,6 +667,9 @@ class MultiRangeDownloader {
             );
             return;
           }
+
+          // P2-13: 必须在真正发起第二路时才置位 road2Started，否则该分块永久失去 hedge 机会
+          road2Started = true;
 
           activeCount++;
 
@@ -693,13 +703,21 @@ class MultiRangeDownloader {
               token0.cancel('并发竞速已决出胜者');
             }
           }).catchError((err) {
-            if (err is RangeNotSupportedException || err is UpstreamHttpException) {
+            // P0-2: RangeNotSupportedException 保持致命（路线级：上游不支持 Range 只能降级直连）
+            if (err is RangeNotSupportedException) {
               if (!completer.isCompleted) {
                 token0.cancel(err.toString());
                 token1.cancel(err.toString());
                 completer.completeError(err);
               }
               return;
+            }
+            // P0-2: UpstreamHttpException 降级为节点级可重试错误，记入 errors，让另一路或下一轮候选重试继续
+            if (err is UpstreamHttpException) {
+              BtrLog.rateLimitedLog(
+                'upstream_http_retry_${BtrLog.hostOf(pair[1])}',
+                '[BTR] 节点级错误转重试 piece#${piece.index} 来源=${BtrLog.hostOf(pair[1])} HTTP ${err.statusCode}',
+              );
             }
             errors.add(err);
           }).whenComplete(() {
@@ -732,13 +750,21 @@ class MultiRangeDownloader {
             token1.cancel('并发竞速已决出胜者');
           }
         }).catchError((err) {
-          if (err is RangeNotSupportedException || err is UpstreamHttpException) {
+          // P0-2: RangeNotSupportedException 保持致命（路线级：上游不支持 Range 只能降级直连）
+          if (err is RangeNotSupportedException) {
             if (!completer.isCompleted) {
               token0.cancel(err.toString());
               token1.cancel(err.toString());
               completer.completeError(err);
             }
             return;
+          }
+          // P0-2: UpstreamHttpException 降级为节点级可重试错误，记入 errors，让另一路或下一轮候选重试继续
+          if (err is UpstreamHttpException) {
+            BtrLog.rateLimitedLog(
+              'upstream_http_retry_${BtrLog.hostOf(pair[0])}',
+              '[BTR] 节点级错误转重试 piece#${piece.index} 来源=${BtrLog.hostOf(pair[0])} HTTP ${err.statusCode}',
+            );
           }
           errors.add(err);
         }).whenComplete(() {
@@ -773,7 +799,9 @@ class MultiRangeDownloader {
         } catch (e) {
           pieceTimeoutTimer?.cancel();
           hedgeTimer?.cancel();
-          if (e is RangeNotSupportedException || e is UpstreamHttpException) {
+          // P0-2: 只有 RangeNotSupportedException 立即向外抛出；
+          // UpstreamHttpException 与其他节点级异常继续走外层循环重试下一个候选
+          if (e is RangeNotSupportedException) {
             rethrow;
           }
           lastError = e;
@@ -787,6 +815,108 @@ class MultiRangeDownloader {
     }
 
     throw lastError ?? Exception('所有候选 CDN 尝试均失败');
+  }
+
+  /// 下载单个 piece，带 Hedge 双路竞速与重试机制，并在短响应时自动续拉拼接 (P0-1)
+  Future<PieceResult> downloadPiece({
+    required RangePiece piece,
+    required CdnPool pool,
+    required CancellationToken token,
+    List<String> preferredUrls = const [],
+    bool startupMode = false,
+    int priority = 0,
+    bool Function()? isSlowPieceEligible,
+    bool Function()? isHedgeAllowed,
+    void Function(void Function() triggerHedge)? onHedgeReady,
+  }) async {
+    final winner = await _downloadPieceInternal(
+      piece: piece,
+      pool: pool,
+      token: token,
+      preferredUrls: preferredUrls,
+      startupMode: startupMode,
+      priority: priority,
+      isSlowPieceEligible: isSlowPieceEligible,
+      isHedgeAllowed: isHedgeAllowed,
+      onHedgeReady: onHedgeReady,
+    );
+
+    if (winner.actualEnd >= piece.end) {
+      return winner;
+    }
+
+    // P0-1: 只有 res.total != null && res.actualEnd >= res.total! - 1 才算真 EOF
+    final isTrueEof =
+        winner.total != null && winner.actualEnd >= winner.total! - 1;
+    if (isTrueEof) {
+      return winner;
+    }
+
+    // total 未知（null）时按现状处理（短响应视为 EOF）。
+    // 理由：当上游 CDN 未在 Content-Range 中提供文件总长度（如返回 Content-Range: bytes 0-100/*），
+    // 客户端无法可靠获知文件总大小与当前是否已至文件尾；此时若盲目发起续拉极易导致循环死锁，
+    // 故按规范安全保守地将短响应视为文件 EOF 交付下游。
+    if (winner.total == null) {
+      return winner;
+    }
+
+    // P0-1: 短响应且未到 EOF 时，必须续拉剩余区间 [actualEnd + 1, piece.end]，把结果拼在同一块内
+    final allChunks = <Uint8List>[winner.bytes];
+    var currentActualEnd = winner.actualEnd;
+    int resumes = 0;
+    const maxResumes = 4;
+
+    while (currentActualEnd < piece.end &&
+        currentActualEnd < winner.total! - 1) {
+      if (resumes >= maxResumes) {
+        throw HttpException(
+          '分块 piece#${piece.index} 连续 $maxResumes 次短响应未补全: '
+          '已获取至 $currentActualEnd, 期望 ${piece.end}, total=${winner.total}',
+        );
+      }
+      resumes++;
+      final subPiece = RangePiece(
+        start: currentActualEnd + 1,
+        end: piece.end,
+        index: piece.index,
+        length: piece.end - currentActualEnd,
+      );
+      BtrLog.rateLimitedLog(
+        'short_resp_resume_${piece.index}_$resumes',
+        '[BTR] 短响应续拉 piece#${piece.index} 第 $resumes 次: '
+        'bytes=${subPiece.start}-${subPiece.end} (已获取至 $currentActualEnd, total=${winner.total})',
+      );
+
+      final subRes = await _downloadPieceInternal(
+        piece: subPiece,
+        pool: pool,
+        token: token,
+        preferredUrls: [winner.url, ...preferredUrls],
+        startupMode: false,
+        priority: priority,
+        isSlowPieceEligible: isSlowPieceEligible,
+        isHedgeAllowed: isHedgeAllowed,
+        onHedgeReady: onHedgeReady,
+      );
+
+      allChunks.add(subRes.bytes);
+      currentActualEnd = subRes.actualEnd;
+      if (subRes.total != null && currentActualEnd >= subRes.total! - 1) {
+        break;
+      }
+    }
+
+    final combinedBytes = RangeCore.concatChunks(
+      allChunks,
+      currentActualEnd - piece.start + 1,
+    );
+    return PieceResult(
+      bytes: combinedBytes,
+      total: winner.total,
+      url: winner.url,
+      bps: winner.bps,
+      actualEnd: currentActualEnd,
+    );
   }
 
   /// 向上游发送真正的 HEAD 请求探测元数据，只读响应头中的 Content-Range / Content-Length
@@ -959,7 +1089,7 @@ class MultiRangeDownloader {
         }
       });
 
-      final candidateTimers = <Timer>[];
+      final candidateTimers = <int, Timer>{};
       for (var i = 0; i < batch.urls.length; i++) {
         final url = batch.urls[i];
         triedCandidates.add(url);
@@ -973,9 +1103,10 @@ class MultiRangeDownloader {
             : RangeCore.startupStaggerDelaysMs.last;
 
         void launchCandidate() {
+          candidateTimers.remove(i);
           if (batchToken.isCancelled || childToken.isCancelled) {
             activeInBatch--;
-            if (activeInBatch == 0 && !batchCompleter.isCompleted) {
+            if (activeInBatch <= 0 && !batchCompleter.isCompleted) {
               batchTimer.cancel();
               batchCompleter.complete();
             }
@@ -1011,9 +1142,20 @@ class MultiRangeDownloader {
               if (bestResult == null || res.bps > (bestResult?.bps ?? 0.0)) {
                 bestResult = res;
               }
-              // 胜出且拿到数据，取消未发起的交错定时器
-              for (final t in candidateTimers) {
+              // P1-7: 胜出且拿到数据，取消未发起的交错定时器并扣减计数
+              for (final t in candidateTimers.values) {
                 t.cancel();
+                activeInBatch--;
+              }
+              candidateTimers.clear();
+
+              // P1-7: 若决出胜者且关键项（如锚点结果）满足，提前取消批次定时器并结束批次，省下 200~240ms
+              final hasAnchorInBatch = pool.anchorUrl != null &&
+                  batch.urls.any((u) => CdnBanList.hostOf(u) == pool.anchorHost);
+              final anchorSatisfied = !hasAnchorInBatch || anchorResult != null;
+              if (bestResult != null && anchorSatisfied && !batchCompleter.isCompleted) {
+                batchTimer.cancel();
+                batchCompleter.complete();
               }
             }
           }).catchError((err) {
@@ -1030,7 +1172,7 @@ class MultiRangeDownloader {
             }
           }).whenComplete(() {
             activeInBatch--;
-            if (activeInBatch == 0 && !batchCompleter.isCompleted) {
+            if (activeInBatch <= 0 && !batchCompleter.isCompleted) {
               batchTimer.cancel();
               batchCompleter.complete();
             }
@@ -1041,25 +1183,29 @@ class MultiRangeDownloader {
           launchCandidate();
         } else {
           final t = Timer(Duration(milliseconds: staggerDelayMs), () {
-            if (!batchToken.isCancelled &&
-                (bestResult == null || anchorResult == null)) {
-              launchCandidate();
-            } else {
-              activeInBatch--;
-              if (activeInBatch == 0 && !batchCompleter.isCompleted) {
-                batchTimer.cancel();
-                batchCompleter.complete();
+            if (candidateTimers.containsKey(i)) {
+              candidateTimers.remove(i);
+              if (!batchToken.isCancelled &&
+                  (bestResult == null || anchorResult == null)) {
+                launchCandidate();
+              } else {
+                activeInBatch--;
+                if (activeInBatch <= 0 && !batchCompleter.isCompleted) {
+                  batchTimer.cancel();
+                  batchCompleter.complete();
+                }
               }
             }
           });
-          candidateTimers.add(t);
+          candidateTimers[i] = t;
         }
       }
 
       await batchCompleter.future;
-      for (final t in candidateTimers) {
+      for (final t in candidateTimers.values) {
         t.cancel();
       }
+      candidateTimers.clear();
       batchTimer.cancel();
       token.removeListener(onParentCancel);
 
@@ -1528,8 +1674,11 @@ class _SlidingWindowStreamer {
       }
     }).catchError((Object err, StackTrace stackTrace) {
       if (!_completer.isCompleted) {
-        token.cancel(err);
+        // ⚠️ 顺序要紧：先 completeError 再 cancel。
+        // token.cancel 会**同步**触发 onCancel → 那里也会 completeError(CancellationException)，
+        // 于是后一次 completeError 会抛 `Bad state: Future already completed`（真机表现为错误被顶掉）。
         _completer.completeError(err, stackTrace);
+        token.cancel(err);
       }
     });
   }
@@ -1601,7 +1750,12 @@ class _SlidingWindowStreamer {
         _recentTransfers.add((timeMs: nowMs, bytes: res.bytes.lengthInBytes));
         _streamTotalBytes += res.bytes.lengthInBytes;
 
-        if (res.actualEnd < piece.end) {
+        // P0-1: 只有明确到达文件末尾（res.actualEnd >= res.total! - 1），
+        // 或 total 未知时的短响应，才视为真实 EOF。
+        final isTrueEof =
+            res.total != null && res.actualEnd >= res.total! - 1;
+        final isUnknownTotal = res.total == null && res.actualEnd < piece.end;
+        if (isTrueEof || isUnknownTotal) {
           _eofReached = true;
           _eofIndex = index;
           _abortInFlightAfter(index);
@@ -1727,10 +1881,20 @@ class _SlidingWindowStreamer {
         _inFlightHedgeLaunchers.remove(index);
         if (token.isCancelled || _completer.isCompleted || _isDegraded) return;
 
-        if (err is RangeNotSupportedException || err is UpstreamHttpException) {
-          token.cancel(err);
+        // P0-2: RangeNotSupportedException 保持致命（路线级：上游不支持 Range 只能降级直连）
+        if (err is RangeNotSupportedException) {
+          // 同上：completeError 必须先于 cancel，否则 onCancel 抢先完成 completer → StateError
           _completer.completeError(err, stackTrace);
+          token.cancel(err);
           return;
+        }
+
+        // P0-2: UpstreamHttpException 候选耗尽，不许杀死整个流，降级为单连接顺序透传续传
+        if (err is UpstreamHttpException) {
+          BtrLog.rateLimitedLog(
+            'piece_exhausted_degrade',
+            '[BTR] 候选耗尽，降级直连 piece#$index: HTTP ${err.statusCode}',
+          );
         }
 
         // 单个分块重试失败：记录错误，交由 _triggerFlush 在流到该位置时降级为单连接顺序透传

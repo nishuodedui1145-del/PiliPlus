@@ -236,6 +236,10 @@ void main() {
       // 但同节点的其它资源依然放行（node 未被连累）
       const anotherUrl = 'https://mirrorali.bilivideo.com/video/stream2.m4s?sign=2';
       expect(banList.allows(anotherUrl), isTrue);
+
+      // 异节点相同路径不连累（P0-3: addressOf / pairOf 带 host，杜绝株连）
+      const otherHostSamePath = 'https://mirrorhw.bilivideo.com/video/stream1.m4s?sign=1';
+      expect(banList.allows(otherHostSamePath), isTrue);
     });
 
     test('连续 0 字节错误达到 strikeLimit 封禁 host', () {

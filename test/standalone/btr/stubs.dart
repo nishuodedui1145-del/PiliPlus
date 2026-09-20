@@ -1,6 +1,5 @@
 // 自动生成的最小桩：替换 PiliPlus app 侧的 BrowserUa / HttpString / Accounts。
 // 由 tool/make_btr_mirror.py 生成，不要手改。
-import 'dart:io';
 
 abstract final class BrowserUa {
   static const pc =
