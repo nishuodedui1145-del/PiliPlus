@@ -10,6 +10,7 @@ import 'package:PiliPlus/pages/setting/widgets/ordered_multi_select_dialog.dart'
 import 'package:PiliPlus/pages/setting/widgets/select_dialog.dart';
 import 'package:PiliPlus/plugin/pl_player/models/audio_output_type.dart';
 import 'package:PiliPlus/plugin/pl_player/models/hwdec_type.dart';
+import 'package:PiliPlus/services/btr_proxy/proxy_server.dart';
 import 'package:PiliPlus/utils/filtering_text.dart';
 import 'package:PiliPlus/utils/storage.dart';
 import 'package:PiliPlus/utils/storage_key.dart';
@@ -82,6 +83,48 @@ List<SettingsModel> get videoSettings => [
     setKey: SettingBoxKey.disableAudioCDN,
     defaultVal: false,
     onChanged: (value) => VideoUtils.disableAudioCDN = value,
+  ),
+  SwitchModel(
+    title: 'BTR 多线程加速',
+    subtitle:
+        '通过本地代理与多 Range 并发分片拉取，提升视频缓冲与拖拽响应速度。只作用于视频播放页（「仅音频」模式、直播、离线播放不走代理）',
+    leading: const Icon(Icons.bolt_outlined),
+    setKey: SettingBoxKey.btrEnabled,
+    defaultVal: false,
+    onChanged: (value) => SmartDialog.showToast('下次进入视频生效'),
+  ),
+  NormalModel(
+    title: 'BTR 并发上限',
+    leading: const Icon(Icons.speed_outlined),
+    getSubtitle: () =>
+        '当前：${Pref.btrConcurrency} 线程。官方建议 8 起步，不够再试 16/32（32 以上反而可能更慢）；'
+        '实际会按实测速度自适应下探（快节点可能只用 2）；音频流固定 2 条，与这个值无关。'
+        '只作用于视频播放页（「仅音频」模式、直播、离线播放不走代理）。改动后需重新进入视频（或切画质）生效',
+    onTap: _showBtrConcurrencyDialog,
+  ),
+  NormalModel(
+    title: 'BTR 节点分组',
+    leading: const Icon(Icons.dns_outlined),
+    getSubtitle: () => switch (Pref.btrGroup) {
+      'mainland' => '当前：固定用大陆节点（对应官方「大陆 CDN」模式）',
+      'overseas' => '当前：固定用海外节点（对应官方「海外 CDN」模式）',
+      _ => '当前：自动 —— 起播时两组各测一批，选快的一组（官方无此项，本移植新增）',
+    },
+    onTap: _showBtrGroupDialog,
+  ),
+  SwitchModel(
+    title: 'BTR CDN 自动竞速',
+    subtitle: '进入视频时快速自动竞速候选 CDN 节点，优先选用实测最快节点。只在 BTR 内部生效',
+    leading: const Icon(Icons.speed),
+    setKey: SettingBoxKey.btrCdnRace,
+    defaultVal: true,
+    needReboot: false,
+    onChanged: (value) {
+      BtrProxyServer.instance.cdnRaceEnabled = value;
+      if (!value) {
+        BtrProxyServer.instance.clearAllRacerHints();
+      }
+    },
   ),
   NormalModel(
     title: '默认画质',
@@ -571,3 +614,44 @@ void _showBufferSecDialog(BuildContext context, VoidCallback setState) =>
       title: '缓冲时长',
       suffix: 's',
     );
+
+Future<void> _showBtrConcurrencyDialog(
+  BuildContext context,
+  VoidCallback setState,
+) async {
+  final res = await showDialog<int>(
+    context: context,
+    builder: (context) => SelectDialog<int>(
+      title: 'BTR 并发上限',
+      value: Pref.btrConcurrency,
+      values: const [4, 8, 16, 32, 64].map((e) => (e, '$e 线程')).toList(),
+    ),
+  );
+  if (res != null) {
+    await GStorage.setting.put(SettingBoxKey.btrConcurrency, res);
+    setState();
+  }
+}
+
+/// BTR 节点分组（保守借鉴官方「CDN 模式」：大陆 / 海外；另加「自动」为本移植新增）
+Future<void> _showBtrGroupDialog(
+  BuildContext context,
+  VoidCallback setState,
+) async {
+  final res = await showDialog<String>(
+    context: context,
+    builder: (context) => SelectDialog<String>(
+      title: 'BTR 节点分组',
+      value: Pref.btrGroup,
+      values: const [
+        ('auto', '自动（起播测速后选快的一组，推荐）'),
+        ('mainland', '大陆节点（官方默认模式）'),
+        ('overseas', '海外节点（接近大陆网络差时用）'),
+      ],
+    ),
+  );
+  if (res != null) {
+    await GStorage.setting.put(SettingBoxKey.btrGroup, res);
+    setState();
+  }
+}

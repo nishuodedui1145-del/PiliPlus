@@ -150,3 +150,18 @@ pili_release.json
 dist
 
 test*
+
+# ================= BTR 移植（我们的改动）=================
+# 上游把整个 test/ 忽略了；显式放行我们新增的测试（含镜像测试台产物）
+!test/
+!test/standalone/
+# 但签名直链 fixture 必须排除：里面是带 upsig/deadline/hdnts 的限时下载凭证
+test/fixtures/media_url.txt
+# 内部迭代工作记录（含本机绝对路径、调试日志片段），不对外发布
+BTR_*.md
+BTR_PORT_REPORT.md
+# 官方 BTR 源码副本：公开仓库改为在 README 里给出链接与 MIT 署名
+btr_reference/
+# 早期版本的端到端测试（已被 test/standalone/btr_proxy_e2e_test.dart 取代），不上传
+test/btr_proxy_e2e_test.dart
+# =========================================================

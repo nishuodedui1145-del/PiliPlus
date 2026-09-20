@@ -31,7 +31,11 @@ abstract final class SettingBoxKey {
       audioPlayMode = 'audioPlayMode',
       showBatteryLevel = 'showBatteryLevel',
       playerVolume = 'playerVolume',
-      maxVolume = 'maxVolume';
+      maxVolume = 'maxVolume',
+      btrEnabled = 'btrEnabled',
+      btrConcurrency = 'btrConcurrency',
+      btrGroup = 'btrGroup',
+      btrCdnRace = 'btrCdnRace';
 
   static const String enableVerticalExpand = 'enableVerticalExpand',
       feedBackEnable = 'feedBackEnable',

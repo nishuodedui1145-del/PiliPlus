@@ -1049,4 +1049,21 @@ abstract final class Pref {
 
   static bool get enableEmoteTooltip =>
       _setting.get(SettingBoxKey.enableEmoteTooltip, defaultValue: false);
+
+  static bool get btrEnabled =>
+      _setting.get(SettingBoxKey.btrEnabled, defaultValue: false);
+
+  static int get btrConcurrency =>
+      _setting.get(SettingBoxKey.btrConcurrency, defaultValue: 8);
+
+  /// BTR 节点分组偏好：'auto'（按实测自动选组，默认）/ 'mainland' / 'overseas'
+  /// 对应官方插件的「CDN 模式」（大陆 / 海外 / 自定义）
+  static String get btrGroup =>
+      _setting.get(SettingBoxKey.btrGroup, defaultValue: 'auto');
+
+  /// BTR CDN 自动竞速开关（默认开启）
+  static bool get btrCdnRace =>
+      _setting.get(SettingBoxKey.btrCdnRace, defaultValue: true);
+  static set btrCdnRace(bool value) =>
+      _setting.put(SettingBoxKey.btrCdnRace, value);
 }

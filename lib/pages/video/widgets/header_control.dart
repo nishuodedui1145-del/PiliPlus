@@ -26,6 +26,7 @@ import 'package:PiliPlus/pages/common/common_intro_controller.dart';
 import 'package:PiliPlus/pages/danmaku/danmaku_model.dart';
 import 'package:PiliPlus/pages/setting/models/play_settings.dart'
     show showPlayerVolumeDialog;
+import 'package:PiliPlus/pages/setting/widgets/btr_quick_setting.dart';
 import 'package:PiliPlus/pages/setting/widgets/popup_item.dart';
 import 'package:PiliPlus/pages/setting/widgets/select_dialog.dart';
 import 'package:PiliPlus/pages/video/controller.dart';
@@ -38,6 +39,7 @@ import 'package:PiliPlus/pages/video/widgets/header_mixin.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_repeat.dart';
+import 'package:PiliPlus/services/btr_proxy/proxy_server.dart';
 import 'package:PiliPlus/services/shutdown_timer_service.dart'
     show shutdownTimerService, ShutdownPanel;
 import 'package:PiliPlus/utils/accounts.dart';
@@ -511,6 +513,44 @@ class HeaderControlState extends State<HeaderControl>
                 if (!isFileSource)
                   ListTile(
                     dense: true,
+                    title: const Text('BTR 多线程加速', style: titleStyle),
+                    leading: const Icon(Icons.bolt_outlined, size: 20),
+                    subtitle: Text(
+                      Pref.btrEnabled
+                          ? '已开启 · 并发 ${Pref.btrConcurrency} 线程，点这里调整'
+                          : '已关闭（多 Range 并发拉取可缓解卡顿）',
+                      style: subTitleStyle,
+                    ),
+                    onTap: () {
+                      // ⚠️ 用 showBottomSheet（本页面同面板的「选择画质」就是这么弹的）。
+                      // 绝不能用 showDialog：播放器「更多」面板长在 SmartDialog 的 overlay 里，
+                      // 那里的 Navigator 没有 MaterialLocalizations，showDialog 会抛
+                      // "No MaterialLocalizations found" 且界面毫无反应（真机日志已确认）。
+                      Get.back();
+                      showBottomSheet(
+                        (context, setState) => BtrQuickSettingSheet(
+                          onDone: (action) {
+                            Get.back();
+                            final state = Pref.btrEnabled
+                                ? '已开启 · 并发 ${Pref.btrConcurrency}'
+                                : '已关闭';
+                            if (action == BtrQuickAction.savedAndReload) {
+                              // ⚠️ 必须清掉代理里按视频缓存的 CdnPool/下探状态，
+                              //    否则改了并发/分组再重载也不会生效（会复用旧 pool）
+                              BtrProxyServer.instance.resetForNewVideo();
+                              SmartDialog.showToast('BTR $state，正在重载视频');
+                              videoDetailCtr.queryVideoUrl(fromReset: true);
+                            } else {
+                              SmartDialog.showToast('BTR $state，重新进入视频生效');
+                            }
+                          },
+                        ),
+                      );
+                    },
+                  ),
+                if (!isFileSource)
+                  ListTile(
+                    dense: true,
                     title: const Text('CDN 设置', style: titleStyle),
                     leading: const Icon(MdiIcons.cloudPlusOutline, size: 20),
                     subtitle: Text(
@@ -518,9 +558,12 @@ class HeaderControlState extends State<HeaderControl>
                       style: subTitleStyle,
                     ),
                     onTap: () async {
+                      // 同上：必须用最近的 Navigator（SmartDialog 的根 Navigator 缺 MaterialLocalizations）
+                      final dialogContext = Navigator.of(context).context;
                       Get.back();
+                      if (!dialogContext.mounted) return;
                       final result = await showDialog<CDNService>(
-                        context: context,
+                        context: dialogContext,
                         builder: (context) => CdnSelectDialog(
                           sample: videoInfo.dash?.video?.firstOrNull,
                         ),

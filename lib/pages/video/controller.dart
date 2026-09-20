@@ -21,6 +21,7 @@ import 'package:PiliPlus/models/common/sponsor_block/post_segment_model.dart';
 import 'package:PiliPlus/models/common/sponsor_block/segment_model.dart';
 import 'package:PiliPlus/models/common/sponsor_block/segment_type.dart';
 import 'package:PiliPlus/models/common/video/audio_quality.dart';
+import 'package:PiliPlus/models/common/video/cdn_type.dart';
 import 'package:PiliPlus/models/common/video/source_type.dart';
 import 'package:PiliPlus/models/common/video/video_decode_type.dart';
 import 'package:PiliPlus/models/common/video/video_quality.dart';
@@ -51,6 +52,7 @@ import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
 import 'package:PiliPlus/plugin/pl_player/models/heart_beat_type.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
+import 'package:PiliPlus/services/btr_proxy/proxy_server.dart';
 import 'package:PiliPlus/services/download/download_service.dart';
 import 'package:PiliPlus/utils/accounts.dart';
 import 'package:PiliPlus/utils/connectivity_utils.dart';
@@ -725,18 +727,56 @@ class VideoDetailController extends GetxController
     Duration? seek = defaultST ?? playedTime;
     if (seek == .zero) seek = null;
     seek ??= getFirstSegment();
-    await plPlayerController.setDataSource(
-      isFileSource
-          ? FileSource(
-              dir: args['dirPath'],
-              typeTag: entry.typeTag!,
-              isMp4: entry.mediaType == 1,
-              hasDashAudio: entry.hasDashAudio,
+    final DataSource dataSource;
+    if (isFileSource) {
+      dataSource = FileSource(
+        dir: args['dirPath'],
+        typeTag: entry.typeTag!,
+        isMp4: entry.mediaType == 1,
+        hasDashAudio: entry.hasDashAudio,
+      );
+    } else if (Pref.btrEnabled) {
+      final canProxyVideo = videoUrl != null &&
+          (videoUrl!.startsWith('http://') || videoUrl!.startsWith('https://'));
+      final canProxyAudio = audioUrl != null &&
+          audioUrl!.isNotEmpty &&
+          (audioUrl!.startsWith('http://') || audioUrl!.startsWith('https://'));
+
+      if (canProxyVideo || canProxyAudio) {
+        BtrProxyServer.instance.cdnCandidates = CDNService.values
+            .where((e) => e.host != null)
+            .map((e) => e.host!)
+            .toList();
+        BtrProxyServer.instance.cdnRaceEnabled = Pref.btrCdnRace;
+        await BtrProxyServer.instance.ensureStarted();
+      }
+      final pVideo = canProxyVideo
+          ? BtrProxyServer.instance.buildProxyUrl(
+              videoUrl!,
+              threads: Pref.btrConcurrency,
+              kind: 'video',
+              group: Pref.btrGroup,
             )
-          : NetworkSource(
-              videoSource: videoUrl!,
-              audioSource: audioUrl,
-            ),
+          : videoUrl!;
+      final pAudio = canProxyAudio
+          ? BtrProxyServer.instance.buildProxyUrl(
+              audioUrl!,
+              threads: 2,
+              kind: 'audio',
+            )
+          : audioUrl;
+      dataSource = NetworkSource(
+        videoSource: pVideo,
+        audioSource: pAudio,
+      );
+    } else {
+      dataSource = NetworkSource(
+        videoSource: videoUrl!,
+        audioSource: audioUrl,
+      );
+    }
+    await plPlayerController.setDataSource(
+      dataSource,
       seekTo: seek,
       duration: data.timeLength == null
           ? null
@@ -1259,10 +1299,12 @@ class VideoDetailController extends GetxController
       ..dispose();
     subtitles.clear();
     vttSubtitles.clear();
+    BtrProxyServer.instance.scheduleStop();
     super.onClose();
   }
 
   void onReset({bool isStein = false}) {
+    BtrProxyServer.instance.resetForNewVideo();
     if (isFileSource) {
       cacheLocalProgress();
     }

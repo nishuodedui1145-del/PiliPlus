@@ -1,0 +1,28 @@
+# BTR 端到端测试用的媒体直链（模板）
+
+这个文件是 `test/standalone/btr_proxy_e2e_test.dart` 读取的输入。
+真实的 `media_url.txt` **不会**提交到仓库 —— 它里面是带 `upsig` / `deadline` / `hdnts` 的
+**限时签名直链**，等价于一份临时下载凭证。
+
+## 怎么生成
+
+需要 `yt-dlp`（`pip install -U yt-dlp`），然后用任意一个 B 站视频取一条真实的视频流地址：
+
+```bash
+yt-dlp -g --no-warnings -f 30016 "https://www.bilibili.com/video/BV1xx411c7mD" > test/fixtures/media_url.txt
+```
+
+- `-f 30016` 是「1080P 60fps」的 DASH 视频流；想换别的清晰度可以先用 `yt-dlp -F <url>` 列出 format id。
+- 生成的链接通常 **几十分钟内有效**，过期后测试会在 `setUpAll` 阶段直接失败（这是刻意的 fail-fast，避免"测试假绿"）。
+- 重跑测试前重新生成一次即可。
+
+## 断言的规模
+
+```
+wc -c test/fixtures/media_url.txt    # 正常约 680 字节（一行 URL）
+```
+
+## 注意
+
+- 不要把这个真实文件 `git add -f` 上去；`.gitignore` 已经排除它。
+- 测试只校验「代理返回的字节流与直连完全一致」等逻辑，**不需要**这个链接长期有效。
