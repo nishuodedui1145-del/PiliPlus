@@ -24,11 +24,17 @@ const double kUnknownBitrateFallbackBps = 1.0 * 1024 * 1024;
 /// 粘性节点解绑速度门限倍数：实测速度低于「码率 × 该倍数」即解绑
 const double kStickySpeedMargin = 1.2;
 
-/// 负责记录并封禁同一视频内“连续两次收到 0 字节”的坏节点
+/// 负责记录并封禁坏节点（对齐官方 cdn-resolver.js:125-146 node / address / pair 三级封禁）
 class CdnBanList {
   final int strikeLimit;
   final Map<String, int> _strikes = {};
   final Set<String> _banned = {};
+
+  final Map<String, int> _addressStrikes = {};
+  final Set<String> _addressBanned = {};
+
+  final Map<String, int> _pairStrikes = {};
+  final Set<String> _pairBanned = {};
 
   CdnBanList({this.strikeLimit = 2});
 
@@ -40,17 +46,59 @@ class CdnBanList {
     }
   }
 
+  static String addressOf(String url) {
+    try {
+      final uri = Uri.parse(url);
+      return uri.path.toLowerCase();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  static String pairOf(String url) {
+    final h = hostOf(url);
+    final a = addressOf(url);
+    if (h.isEmpty || a.isEmpty) return '';
+    return '$h|$a';
+  }
+
   /// 记录一次传输结果。若传输了 >0 字节，或为 Range 不支持降级，则不算作死节点
   bool record(String url, int receivedBytes, Object? error, {bool isAbort = false}) {
     if (isAbort || error is RangeNotSupportedException || receivedBytes > 0) return false;
-    // 官方规范：某个下载地址一直被服务器拒绝（如 403 / 404 / 410），只停用这个地址，不连累节点 strike
+
+    final host = hostOf(url);
+    final address = addressOf(url);
+    final pair = pairOf(url);
+
+    // 官方规范：某个下载地址一直被服务器拒绝（如 403 / 404 / 410），只停用这个地址与 pair，不连累节点 strike
     if (error is UpstreamHttpException &&
         (error.statusCode == 403 ||
             error.statusCode == 404 ||
             error.statusCode == 410)) {
+      if (address.isNotEmpty && !_addressBanned.contains(address)) {
+        final c = (_addressStrikes[address] ?? 0) + 1;
+        _addressStrikes[address] = c;
+        if (c >= strikeLimit) _addressBanned.add(address);
+      }
+      if (pair.isNotEmpty && !_pairBanned.contains(pair)) {
+        final c = (_pairStrikes[pair] ?? 0) + 1;
+        _pairStrikes[pair] = c;
+        if (c >= strikeLimit) _pairBanned.add(pair);
+      }
       return false;
     }
-    final host = hostOf(url);
+
+    if (address.isNotEmpty && !_addressBanned.contains(address)) {
+      final c = (_addressStrikes[address] ?? 0) + 1;
+      _addressStrikes[address] = c;
+      if (c >= strikeLimit) _addressBanned.add(address);
+    }
+    if (pair.isNotEmpty && !_pairBanned.contains(pair)) {
+      final c = (_pairStrikes[pair] ?? 0) + 1;
+      _pairStrikes[pair] = c;
+      if (c >= strikeLimit) _pairBanned.add(pair);
+    }
+
     if (host.isEmpty || _banned.contains(host)) return false;
 
     final count = (_strikes[host] ?? 0) + 1;
@@ -64,15 +112,25 @@ class CdnBanList {
 
   bool allows(String url) {
     final host = hostOf(url);
-    if (host.isEmpty) return true;
-    return !_banned.contains(host);
+    if (host.isNotEmpty && _banned.contains(host)) return false;
+    final address = addressOf(url);
+    if (address.isNotEmpty && _addressBanned.contains(address)) return false;
+    final pair = pairOf(url);
+    if (pair.isNotEmpty && _pairBanned.contains(pair)) return false;
+    return true;
   }
 
   List<String> get bannedHosts => _banned.toList();
+  List<String> get bannedAddresses => _addressBanned.toList();
+  List<String> get bannedPairs => _pairBanned.toList();
 
   void reset() {
     _strikes.clear();
     _banned.clear();
+    _addressStrikes.clear();
+    _addressBanned.clear();
+    _pairStrikes.clear();
+    _pairBanned.clear();
   }
 }
 
@@ -282,6 +340,93 @@ class CdnPool {
     adaptiveConcurrency = null;
     slowPieceThreshold = RangeCore.slowPieceThresholdDefault;
     multiBpsAtSwitch = 0.0;
+  }
+
+  /// 是否已判定加速不可行并降级为直连透传（对齐官方 page-hook.js:1074-1081 / 140-158）
+  bool isDirectPassthrough = false;
+
+  /// 重接管尝试次数（最多 3 次，4s / 8s / 16s，2 分钟窗口重置）
+  int retakeoverAttempts = 0;
+
+  /// 上次降级时间戳（毫秒）
+  int lastFallbackTimeMs = 0;
+
+  /// 下一次允许重接管的时间戳（毫秒）
+  int nextRetakeoverTimeMs = 0;
+
+  /// 降级窗口开始时间戳（用于 2 分钟窗口重置）
+  int fallbackWindowStartMs = 0;
+
+  /// 记录一次降级为直连透传
+  void markDirectFallback(String reason) {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (fallbackWindowStartMs == 0 ||
+        now - fallbackWindowStartMs > RangeCore.retakeoverWindowMs) {
+      fallbackWindowStartMs = now;
+      retakeoverAttempts = 0;
+    }
+    isDirectPassthrough = true;
+    lastFallbackTimeMs = now;
+    final attempt = retakeoverAttempts + 1;
+    // 首次重接管延迟 = 宽限期(3500ms，对齐官方 page-hook.js:1074-1081)
+    //                + 退避(4000/8000/16000ms，对齐官方 page-hook.js:140-158)
+    // ⚠️ 宽限期只能体现在时间戳上，绝不能在请求路径里 await 阻塞（那会变成真卡顿）。
+    final delayMs = RangeCore.fallbackGraceMs +
+        RangeCore.retakeoverBaseDelayMs * (1 << min(retakeoverAttempts, 2));
+    nextRetakeoverTimeMs = now + delayMs;
+    BtrLog.rateLimitedLog(
+      'direct_fallback',
+      '[BTR] 降级直连: 原因=$reason 重试=第${min(attempt, RangeCore.retakeoverMaxAttempts)}次/${RangeCore.retakeoverMaxAttempts}',
+    );
+  }
+
+  /// 检查当前是否允许尝试重接管（未超上限且退避时间已到）
+  bool checkRetakeoverEligible() {
+    if (!isDirectPassthrough) return false;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (fallbackWindowStartMs > 0 &&
+        now - fallbackWindowStartMs > RangeCore.retakeoverWindowMs) {
+      fallbackWindowStartMs = 0;
+      retakeoverAttempts = 0;
+    }
+    if (retakeoverAttempts >= RangeCore.retakeoverMaxAttempts) {
+      return false;
+    }
+    if (now >= nextRetakeoverTimeMs) {
+      retakeoverAttempts++;
+      return true;
+    }
+    return false;
+  }
+
+  /// 标记重接管成功，恢复加速状态
+  void onRetakeoverSuccess(String host) {
+    isDirectPassthrough = false;
+    retakeoverAttempts = 0;
+    fallbackWindowStartMs = 0;
+    BtrLog.log('[BTR] 重接管成功');
+  }
+
+  /// 跨节点文件总长度一致性校验（对齐官方 idm-downloader.js:445-446）
+  int? verifiedTotalLength;
+  String? verifiedTotalHost;
+
+  /// 校验从 [host] 收到的文件总长度 [total] 是否与已有记录一致。
+  /// 若不一致返回 false，并输出告警埋点；首次遇到或一致返回 true。
+  bool checkTotalLengthConsistency(int total, String host) {
+    if (verifiedTotalLength == null) {
+      verifiedTotalLength = total;
+      verifiedTotalHost = host;
+      return true;
+    }
+    if (verifiedTotalLength == total) {
+      return true;
+    }
+    BtrLog.rateLimitedLog(
+      'total_mismatch_${verifiedTotalLength}_$total',
+      '[BTR] 不同节点返回的文件总长度不一致: ${verifiedTotalHost ?? "known"}=$verifiedTotalLength $host=$total',
+    );
+    return false;
   }
 
   /// 锁定的最快粘性节点 URL
@@ -897,5 +1042,12 @@ class CdnPool {
       videoBitrateBytesPerSec,
       concurrency: null,
     );
+    isDirectPassthrough = false;
+    retakeoverAttempts = 0;
+    lastFallbackTimeMs = 0;
+    nextRetakeoverTimeMs = 0;
+    fallbackWindowStartMs = 0;
+    verifiedTotalLength = null;
+    verifiedTotalHost = null;
   }
 }

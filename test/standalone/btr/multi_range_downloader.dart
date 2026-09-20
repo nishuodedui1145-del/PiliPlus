@@ -326,6 +326,19 @@ class MultiRangeDownloader {
         );
       }
 
+      // 跨节点文件总长度一致性校验（对齐官方 idm-downloader.js:445-446）
+      if (contentRange?.total != null) {
+        final total = contentRange!.total!;
+        final host = BtrLog.hostOf(url);
+        if (!pool.checkTotalLengthConsistency(total, host)) {
+          req.abort();
+          throw HttpException(
+            '跨节点文件总长度不一致: $host 返回 $total 与之前节点记录不符',
+            uri: Uri(scheme: uri.scheme, host: uri.host, path: uri.path),
+          );
+        }
+      }
+
       if (resp.statusCode < 200 || resp.statusCode >= 300) {
         throw UpstreamHttpException(
           resp.statusCode,
@@ -736,10 +749,13 @@ class MultiRangeDownloader {
         // 第二路（慢块立刻补救，而不是干等）
         if (pair.length > 1) {
           if (startupMode) {
-            hedgeTimer = Timer(const Duration(milliseconds: 250), launchRoad2);
+            hedgeTimer = Timer(RangeCore.startupHedgeDelay, launchRoad2);
           } else {
             onHedgeReady?.call(launchRoad2);
-            hedgeTimer = Timer(slowThreshold, () {
+            final effectiveDelay = slowThreshold < RangeCore.hedgeDelay
+                ? slowThreshold
+                : RangeCore.hedgeDelay;
+            hedgeTimer = Timer(effectiveDelay, () {
               if (isSlowPieceEligible?.call() == true) {
                 launchRoad2();
               }
@@ -943,62 +959,107 @@ class MultiRangeDownloader {
         }
       });
 
-      for (final url in batch.urls) {
+      final candidateTimers = <Timer>[];
+      for (var i = 0; i < batch.urls.length; i++) {
+        final url = batch.urls[i];
         triedCandidates.add(url);
         final childToken = CancellationToken();
         void onBatchCancel() => childToken.cancel(batchToken.reason);
         batchToken.addListener(onBatchCancel);
 
-        attempt(
-          piece: headPiece,
-          url: url,
-          token: childToken,
-          pool: pool,
-          priority: 200,
-        ).then((res) {
-          batchToken.removeListener(onBatchCancel);
-          if (res.bytes.isEmpty || res.bps <= 0.0) {
-            // 判定：测速拿到 0 字节 -> 加入不可用集合
-            pool
-              ..markUnusable(url)
-              ..failure(url, Exception('测速拿到 0 字节'), receivedBytes: res.bytes.length, isAbort: false);
-            results[url] = 0.0;
-          } else {
-            results[url] = res.bps;
-            if (batch.group == CdnGroup.mainland) {
-              if (res.bps > mainlandMaxBps) mainlandMaxBps = res.bps;
+        // 起播交错延迟：[0, 120, 300]ms（对齐官方 idm-downloader.js:315）
+        final staggerDelayMs = (i < RangeCore.startupStaggerDelaysMs.length)
+            ? RangeCore.startupStaggerDelaysMs[i]
+            : RangeCore.startupStaggerDelaysMs.last;
+
+        void launchCandidate() {
+          if (batchToken.isCancelled || childToken.isCancelled) {
+            activeInBatch--;
+            if (activeInBatch == 0 && !batchCompleter.isCompleted) {
+              batchTimer.cancel();
+              batchCompleter.complete();
+            }
+            return;
+          }
+
+          attempt(
+            piece: headPiece,
+            url: url,
+            token: childToken,
+            pool: pool,
+            priority: 200,
+          ).then((res) {
+            batchToken.removeListener(onBatchCancel);
+            if (res.bytes.isEmpty || res.bps <= 0.0) {
+              // 判定：测速拿到 0 字节 -> 加入不可用集合
+              pool
+                ..markUnusable(url)
+                ..failure(url, Exception('测速拿到 0 字节'),
+                    receivedBytes: res.bytes.length, isAbort: false);
+              results[url] = 0.0;
             } else {
-              if (res.bps > overseasMaxBps) overseasMaxBps = res.bps;
+              results[url] = res.bps;
+              if (batch.group == CdnGroup.mainland) {
+                if (res.bps > mainlandMaxBps) mainlandMaxBps = res.bps;
+              } else {
+                if (res.bps > overseasMaxBps) overseasMaxBps = res.bps;
+              }
+              if (pool.anchorUrl != null &&
+                  CdnBanList.hostOf(url) == pool.anchorHost) {
+                anchorResult = res;
+              }
+              if (bestResult == null || res.bps > (bestResult?.bps ?? 0.0)) {
+                bestResult = res;
+              }
+              // 胜出且拿到数据，取消未发起的交错定时器
+              for (final t in candidateTimers) {
+                t.cancel();
+              }
             }
-            if (pool.anchorUrl != null && CdnBanList.hostOf(url) == pool.anchorHost) {
-              anchorResult = res;
+          }).catchError((err) {
+            batchToken.removeListener(onBatchCancel);
+            results[url] = 0.0;
+            if (batchTimedOut && childToken.isCancelled) {
+              // 因整体/批次超时被放弃的批次：视为未知，不加入不可用集合，不阻塞起播
+            } else {
+              // 判定：测速超时或返回错误 -> 加入不可用集合
+              pool.markUnusable(url);
+              if (err is! RangeNotSupportedException) {
+                pool.failure(url, err, isAbort: false);
+              }
             }
-            if (bestResult == null || res.bps > (bestResult?.bps ?? 0.0)) {
-              bestResult = res;
+          }).whenComplete(() {
+            activeInBatch--;
+            if (activeInBatch == 0 && !batchCompleter.isCompleted) {
+              batchTimer.cancel();
+              batchCompleter.complete();
             }
-          }
-        }).catchError((err) {
-          batchToken.removeListener(onBatchCancel);
-          results[url] = 0.0;
-          if (batchTimedOut && childToken.isCancelled) {
-            // 因整体/批次超时被放弃的批次：视为未知，不加入不可用集合，不阻塞起播
-          } else {
-            // 判定：测速超时或返回错误 -> 加入不可用集合
-            pool.markUnusable(url);
-            if (err is! RangeNotSupportedException) {
-              pool.failure(url, err, isAbort: false);
+          });
+        }
+
+        if (staggerDelayMs <= 0) {
+          launchCandidate();
+        } else {
+          final t = Timer(Duration(milliseconds: staggerDelayMs), () {
+            if (!batchToken.isCancelled &&
+                (bestResult == null || anchorResult == null)) {
+              launchCandidate();
+            } else {
+              activeInBatch--;
+              if (activeInBatch == 0 && !batchCompleter.isCompleted) {
+                batchTimer.cancel();
+                batchCompleter.complete();
+              }
             }
-          }
-        }).whenComplete(() {
-          activeInBatch--;
-          if (activeInBatch == 0 && !batchCompleter.isCompleted) {
-            batchTimer.cancel();
-            batchCompleter.complete();
-          }
-        });
+          });
+          candidateTimers.add(t);
+        }
       }
 
       await batchCompleter.future;
+      for (final t in candidateTimers) {
+        t.cancel();
+      }
       batchTimer.cancel();
       token.removeListener(onParentCancel);
 

@@ -107,10 +107,15 @@ Future<(int, int)> streamHash(
     var len = 0;
     var h = 0xcbf29ce484222325;
     await for (final chunk in resp) {
-      for (final b in chunk) {
-        h = ((h ^ b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF;
+      // ⚠️ 必须按 limit 精确截断：开放式 Range 的响应会超出 limit 一个 chunk，
+      //    而直连对照用的是封闭 Range（恰好到界）→ 不截断就会随机"多读"几万字节，
+      //    让这个用例变成 flaky（曾误报成"长流被截断"）。
+      var take = chunk.length;
+      if (len + take > limit) take = limit - len;
+      for (var i = 0; i < take; i++) {
+        h = ((h ^ chunk[i]) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF;
       }
-      len += chunk.length;
+      len += take;
       if (len >= limit) break;
     }
     return (len, h);
@@ -140,7 +145,7 @@ void main() {
     debugPrint('[E2E] 代理端口=${proxy.port}');
   });
 
-  tearDownAll(() async => proxy.stop());
+  tearDownAll(proxy.stop);
 
   test('1. 直连基线 HEAD：拿到文件总长度', () async {
     final r = await fetch(originUrl, head: true);
@@ -158,7 +163,7 @@ void main() {
 
   test('3. 封闭 Range：代理字节与直连逐字节一致', () async {
     const win = 512 * 1024;
-    final range = 'bytes=0-${win - 1}';
+    const range = 'bytes=0-${win - 1}';
     final direct = await fetch(originUrl, range: range);
     final viaProxy = await fetch(proxyUrl, range: range);
     debugPrint('[E2E] 直连 $range -> $direct');

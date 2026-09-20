@@ -84,13 +84,12 @@ abstract final class RangeCore {
   static const int defaultConcurrency = 8;
   static const int defaultMinChunkBytes = 64 * 1024; // 64 KiB
 
-  /// 固定分块大小（默认 128 KiB）
-  /// 对齐官方 splitRange 默认值 minChunkBytes = 128 * 1024 (range-core.js:35)
+  /// 固定分块大小（默认 512 KiB）
+  /// ↑ 回退到第十一轮的值（真机对比：128KB 分块那次起播更慢、速率更差；
+  ///   官方虽然用 64~128KB，但那是在浏览器 MSE 层的形态，我们这里请求开销更贵）
   /// 块大小与并发数完全解耦：块数 = ceil(区间长度 / maxPieceBytes)
-  /// 峰值内存上限 = concurrency × maxPieceBytes（例如 8 × 128 KiB ≈ 1 MiB，24 × 128 KiB ≈ 3 MiB）
+  /// 峰值内存上限 = concurrency × maxPieceBytes（例如 8 × 512 KiB = 4 MiB，32 × 512 KiB = 16 MiB）
   static const int defaultMaxPieceBytes = 512 * 1024; // 512 KiB
-  // ↑ 回退到第十一轮的值（真机对比：128KB 分块那次起播更慢、速率更差；
-  //   官方虽然用 64~128KB，但那是在浏览器 MSE 层的形态，我们这里请求开销更贵）
 
   /// 计算官方并发预算分配（对齐官方 idm-downloader.js:313-318 / 387-392）：
   /// - rescueReserve = max(1, min(8, ceil(c/8)))
@@ -191,6 +190,9 @@ abstract final class RangeCore {
   static const Duration stallTimeout = Duration(milliseconds: 4000);
   static const Duration attemptTimeout = Duration(milliseconds: 15000);
   static const Duration hedgeDelay = Duration(milliseconds: 900);
+
+  /// 起播阶段 hedge 延迟（对齐官方 idm-downloader.js:249 startup hedge = min(250, hedgeDelayMs)）
+  static const Duration startupHedgeDelay = Duration(milliseconds: 250);
 
   /// 慢块判定倍数（实际耗时 > 1.6 × expectedPieceMs 算慢块）
   static const double slowPieceFactor = 1.6;
@@ -300,6 +302,34 @@ abstract final class RangeCore {
   /// 加权选择可用节点时的下限速度（64 KB/s），防止极慢节点权重为 0 或出现异常比例
   static const double minWeightedSelectionBps = 64.0 * 1024;
 
+  /// 起播交错竞速延迟列表（对齐官方 idm-downloader.js:315: [0, 120, 300]ms）
+  static const List<int> startupStaggerDelaysMs = [0, 120, 300];
+
+  /// 起播最多竞速候选数（对齐官方 cdn-resolver.js:254: candidates.slice(0, 8)）
+  static const int startupMaxRaceCandidates = 8;
+
+  /// 降级直连后自动重试并发的退避公式（对齐官方 page-hook.js:157:
+  ///   delay = 4000 * 2^(attempt-1)，最多 3 次，2 分钟窗口重置）
+  static const int retakeoverMaxAttempts = 3;
+  static const int retakeoverBaseDelayMs = 4000;
+  static const int retakeoverWindowMs = 120000; // 2 分钟
+
+  /// 降级直连前的宽限延迟（对齐官方 page-hook.js:1081: setTimeout(..., 3500)）
+  static const int fallbackGraceMs = 3500;
+
+  /// 起播阶段并发起手值公式的 ratio 分档阈值（对齐官方 native-mse-player.js:365-369）
+  /// 代理层翻译：按 ratio = throughput / required 分档推导起播并发起手值
+  ///   ratio >= 3.0 → 起手 2 并发（网络极好，少量并发即够）
+  ///   ratio >= 1.8 → 起手 4 并发
+  ///   ratio >= 1.25 → 起手 6 并发
+  ///   ratio > 0    → 起手 8 并发（配置上限）
+  static const List<(double, int)> startupConcurrencyTiers = [
+    (3.0, 2),
+    (1.8, 4),
+    (1.25, 6),
+    (0.0, 8),
+  ];
+
   static final RegExp _mediaSuffixRegex =
       RegExp(r'\.(?:m4s|mp4|flv)(?:\?|$)', caseSensitive: false);
 
@@ -358,9 +388,9 @@ abstract final class RangeCore {
   /// 将 [start, end] 区间按固定块上限 [maxPieceBytes] 切分成多个 RangePiece
   /// 块大小与并发数完全解耦，块数 = ceil(区间长度 / maxPieceBytes)
   ///
-  /// 【内存上限保证】：单 piece 大小最多为 maxPieceBytes（默认 512 KiB）。
+  /// 【内存上限保证】：单 piece 大小最多为 maxPieceBytes（默认 64 KiB）。
   /// 在滑动窗口调度下，在途 + 缓冲的 piece 数严格不超过 concurrency，
-  /// 故整段流式传输的峰值内存占用有明确上限：concurrency × maxPieceBytes（例如 8 × 128 KiB ≈ 1 MiB，24 × 128 KiB ≈ 3 MiB）。
+  /// 故整段流式传输的峰值内存占用有明确上限：concurrency × maxPieceBytes（例如 8 × 64 KiB = 512 KiB，32 × 64 KiB = 2 MiB）。
   static List<RangePiece> splitRange(
     int start,
     int end, {
@@ -444,6 +474,12 @@ abstract final class BtrLog {
     } catch (_) {
       return url;
     }
+  }
+
+  /// 普通调试日志输出（受 kDebugMode 保护）
+  static void log(String message) {
+    if (!kDebugMode) return;
+    debugPrint(message);
   }
 
   /// 限流日志输出：在 kDebugMode 下同 key 每条日志最多 1 次/秒

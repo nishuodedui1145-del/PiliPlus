@@ -10,8 +10,45 @@ import 'cdn_pool.dart';
 import 'cdn_racer.dart';
 import 'multi_range_downloader.dart';
 import 'range_core.dart';
+import 'sidx_parser.dart';
 import 'stubs.dart';
 import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
+
+/// 全局在途 Socket 预算协调器（对齐官方 idm-downloader.js:402-407）
+///
+/// 画面与声音分开预算，并设置跨请求的全局在途硬上限，避免画面把声音的连接占满。
+class GlobalSocketBudget {
+  int _videoActive = 0;
+  int _audioActive = 0;
+  int _rescueActive = 0;
+
+  int _videoLimit = 8;
+  int _audioLimit = 2;
+  int _rescueLimit = 1;
+
+  int get videoActive => _videoActive;
+  int get audioActive => _audioActive;
+  int get rescueActive => _rescueActive;
+  int get totalActive => _videoActive + _audioActive + _rescueActive;
+
+  int get videoLimit => _videoLimit;
+  int get audioLimit => _audioLimit;
+  int get rescueLimit => _rescueLimit;
+  int get globalLimit => _videoLimit + _audioLimit + _rescueLimit;
+
+  void updateBudget(int concurrency) {
+    final b = RangeCore.calculateBudget(concurrency);
+    _videoLimit = b.videoBudget;
+    _audioLimit = b.audioBudget;
+    _rescueLimit = b.rescueReserve;
+  }
+
+  void reset() {
+    _videoActive = 0;
+    _audioActive = 0;
+    _rescueActive = 0;
+  }
+}
 
 /// 本地 BTR HTTP 代理服务器
 class BtrProxyServer {
@@ -28,6 +65,8 @@ class BtrProxyServer {
   final Map<String, int> _totalLengthCache = {};
   int? _lastConfiguredConcurrency;
   Timer? _scheduledStopTimer;
+  final GlobalSocketBudget socketBudget = GlobalSocketBudget();
+  final Set<String> _inFlightSidxPrefetches = {};
   int _lastRequestTimestamp = 0;
 
   final CdnRacer racer = CdnRacer();
@@ -229,6 +268,8 @@ class BtrProxyServer {
     _downloaderCache.clear();
     _totalLengthCache.clear();
     _lastConfiguredConcurrency = null;
+    socketBudget.reset();
+    _inFlightSidxPrefetches.clear();
     _httpClient?.close(force: true);
     _httpClient = null;
     _lastRequestTimestamp = 0;
@@ -349,12 +390,17 @@ class BtrProxyServer {
         ? _lastConfiguredConcurrency!
         : threads;
     final budget = RangeCore.calculateBudget(baseC);
+    socketBudget.updateBudget(baseC);
     final allocatedThreads = (kind == 'audio')
         ? budget.audioBudget
         : budget.videoBudget;
     final maxSockets = (kind == 'video')
         ? (budget.videoBudget + budget.rescueReserve)
         : budget.audioBudget;
+    BtrLog.rateLimitedLog(
+      'budget_allocated_$baseC',
+      '[BTR] 预算划分: 视频=${budget.videoBudget}, 音频=${budget.audioBudget}, 预留=${budget.rescueReserve}, 全局上限=${budget.videoBudget + budget.audioBudget + budget.rescueReserve}',
+    );
 
     final token = CancellationToken();
     _activeTokens.add(token);
@@ -446,6 +492,57 @@ class BtrProxyServer {
       ..setConcurrency(initialConcurrency, maxInFlightSockets: maxSockets);
 
     try {
+      // 检查是否处于降级直连状态（对齐官方 page-hook.js:140-158 / 1074-1081）
+      if (pool.isDirectPassthrough && request.method == 'GET') {
+        if (pool.checkRetakeoverEligible()) {
+          BtrLog.rateLimitedLog(
+            'retakeover_attempt',
+            '[BTR] 尝试重接管: host=${BtrLog.hostOf(targetUrl)} 第${pool.retakeoverAttempts}次/${RangeCore.retakeoverMaxAttempts}',
+          );
+        } else {
+          await _passthrough(
+            clientRequest: request,
+            targetUrl: targetUrl,
+            token: token,
+            defaultHeaders: headers,
+            onByteSent: () => bytesSent = true,
+            pool: pool,
+            downloader: downloader,
+          );
+          return;
+        }
+      }
+
+      // SIDX 缓存查询与后台预取（对齐官方 sidx.js / native-mse-player.js:214-216）
+      final urlKey = SidxCache.urlToKey(targetUrl);
+      if (request.method == 'GET') {
+        final cachedSidx = SidxCache.get(urlKey);
+        if (cachedSidx != null) {
+          BtrLog.rateLimitedLog(
+            'sidx_hit_$urlKey',
+            '[BTR] sidx 缓存命中: host=${BtrLog.hostOf(targetUrl)}',
+          );
+        } else {
+          // sidx 只对"可能走流式下载"的请求有用：无 Range，或开放式 Range（bytes=N-）。
+          // 封闭 Range（bytes=N-M）由下载器内部等分切片，永远用不到 sidx ——
+          // 给它预取就是白扣海外带宽，还会跟正在下载的请求抢连接。
+          final rangeHeader = request.headers.value(HttpHeaders.rangeHeader);
+          final isStreamLike = rangeHeader == null ||
+              RegExp(r'^bytes=\d+-$').hasMatch(rangeHeader.trim());
+          if (isStreamLike) {
+            BtrLog.rateLimitedLog(
+              'sidx_miss_$urlKey',
+              '[BTR] sidx 缓存未命中: host=${BtrLog.hostOf(targetUrl)}',
+            );
+            _prefetchSidx(
+              targetUrl: targetUrl,
+              defaultHeaders: headers,
+              pool: pool,
+            );
+          }
+        }
+      }
+
       // 任务 B：粘性单连接偏好命中（该视频多连接已判亏，直接单连接启动）
       if (pool.hasStickySingleConnection && request.method == 'GET') {
         if (kDebugMode) {
@@ -603,6 +700,9 @@ class BtrProxyServer {
       }
 
       if (probeMaybe == null) {
+        // 首响应超时，判定加速不可行，记录降级直连状态（对齐官方 page-hook.js:1074-1081 / 140-158）
+        pool.markDirectFallback('首响应超时');
+
         // ⚠️ Dart HttpServer 的响应头**只有在写入至少 1 字节 body 时才会真正发出**
         // （PC 实测：只 flush() / bufferOutput=false + add(空) 都一个字节也发不出去）。
         // 所以这里用一个「1 字节 Range」把响应头顶出去：1 字节请求几乎只受 RTT 影响，
@@ -612,6 +712,7 @@ class BtrProxyServer {
           start: start,
           defaultHeaders: headers,
           token: token,
+          pool: pool,
         );
         final primerBytes = primer.bytes;
         // 顶头响应里带 Content-Range: bytes N-N/总长度 —— 顺手把总长度拿回来。
@@ -746,7 +847,26 @@ class BtrProxyServer {
           );
         }
       } else {
-        adaptiveConcurrency = allocatedThreads;
+        // 起播阶段：通过 startupConcurrencyTiers 决定起播并发起手值（对齐官方 native-mse-player.js:365-369）
+        final requiredBps = RangeCore.requiredThroughputBytesPerSec(
+            pool.videoBitrateBytesPerSec);
+        final ratio = (requiredBps > 0 && probe.bps > 0)
+            ? (probe.bps / requiredBps)
+            : 0.0;
+        int tierConcurrency = allocatedThreads;
+        for (final tier in RangeCore.startupConcurrencyTiers) {
+          if (ratio >= tier.$1) {
+            tierConcurrency = min(tier.$2, allocatedThreads);
+            break;
+          }
+        }
+        adaptiveConcurrency = max(1, tierConcurrency);
+        pool.adaptiveConcurrency = adaptiveConcurrency;
+        BtrLog.rateLimitedLog(
+          'startup_tier_${targetUrl.hashCode}',
+          '[BTR] 起播并发起手值: ratio=${ratio.toStringAsFixed(2)} '
+          '-> 并发=$adaptiveConcurrency (配置上限=$allocatedThreads)',
+        );
       }
 
       // 设置客户端响应状态与头
@@ -778,14 +898,50 @@ class BtrProxyServer {
       await request.response.flush();
       bytesSent = true;
 
-      // 无 Range 和开放式 Range 统一采用固定块滑动窗口流式下载
+      // 若处于重接管中且成功发送数据，恢复加速状态
+      if (pool.isDirectPassthrough) {
+        pool.onRetakeoverSuccess(BtrLog.hostOf(targetUrl));
+      }
+
+      // 若 probe.headBytes 覆盖头部，且 sidx 尚未解析，解析并加入缓存
+      if (SidxCache.get(urlKey) == null && probe.headStart == 0) {
+        final parsed = SidxParser.parseSidx(probe.headBytes, 0);
+        if (parsed != null && parsed.segments.isNotEmpty) {
+          SidxCache.put(urlKey, parsed);
+        }
+      }
+
+      // 无 Range 和开放式 Range 统一采用流式下载（按 sidx 分段边界或回退等分）
       if (probe.headEnd < effectiveEnd) {
         final remainingStart = probe.headEnd + 1;
-        final pieces = RangeCore.splitRange(
-          remainingStart,
-          effectiveEnd,
-          maxPieceBytes: RangeCore.defaultMaxPieceBytes,
-        );
+        List<RangePiece>? pieces;
+        final sidx = SidxCache.get(urlKey);
+        if (sidx != null && sidx.segments.isNotEmpty) {
+          final sidxPieces = SidxParser.planSegmentAlignedPieces(
+            sidx.segments,
+            remainingStart,
+            effectiveEnd,
+            maxPieceBytes: RangeCore.defaultMaxPieceBytes,
+          );
+          if (sidxPieces.isNotEmpty) {
+            pieces = sidxPieces;
+            BtrLog.rateLimitedLog(
+              'sidx_plan_$urlKey',
+              '[BTR] 按分段边界规划 ${pieces.length} 段: host=${BtrLog.hostOf(targetUrl)}',
+            );
+          }
+        }
+        if (pieces == null || pieces.isEmpty) {
+          BtrLog.rateLimitedLog(
+            'sidx_fallback_$urlKey',
+            '[BTR] sidx 不可用 → 回退等分: host=${BtrLog.hostOf(targetUrl)}',
+          );
+          pieces = RangeCore.splitRange(
+            remainingStart,
+            effectiveEnd,
+            maxPieceBytes: RangeCore.defaultMaxPieceBytes,
+          );
+        }
 
         if (pieces.isNotEmpty) {
           final effectiveV1 = probe.bps > 0
@@ -816,7 +972,11 @@ class BtrProxyServer {
           debugPrint('[BTR] 响应已发送部分数据后检测到不支持 Range ($e)，中止连接');
         }
       } else {
-        // 识别上游不支持/忽略 Range，降级为单连接顺序透传
+        // 识别上游不支持/忽略 Range，标记降级直连（对齐官方 page-hook.js:1074-1081）
+        // ⚠️ 官方那个 3500ms 宽限期必须做成"时间戳"，**不能在这里 await**：
+        //    本函数在请求路径里，任何延迟都会直接变成播放器侧 3.5 秒的卡顿。
+        //    宽限期已计入 CdnPool.markDirectFallback 的首个重接管延迟。
+        pool.markDirectFallback('上游不支持或忽略Range');
         _rangeUnsupportedUrls.add(targetUrl);
         pool.singleConnectionSwitchCount++;
         if (kDebugMode) {
@@ -917,6 +1077,66 @@ class BtrProxyServer {
         }
       } finally {
         _inFlightRace = null;
+      }
+    }());
+  }
+
+  void _prefetchSidx({
+    required String targetUrl,
+    required Map<String, String> defaultHeaders,
+    required CdnPool pool,
+  }) {
+    final urlKey = SidxCache.urlToKey(targetUrl);
+    if (SidxCache.get(urlKey) != null || _inFlightSidxPrefetches.contains(urlKey)) {
+      return;
+    }
+    _inFlightSidxPrefetches.add(urlKey);
+
+    unawaited(() async {
+      try {
+        final client = _getOrCreateHttpClient();
+        final uri = Uri.parse(targetUrl);
+        final req = await client.openUrl('GET', uri);
+        req
+          ..followRedirects = true
+          ..maxRedirects = 5;
+        defaultHeaders.forEach((k, v) {
+          req.headers.set(k, v);
+        });
+        // 预取前 256 KiB（足够覆盖 ftyp + moov + sidx；官方在 MSE 层也只取 init+sidx，
+        // 这里从 2 MiB 收窄：预取同样要走海外链路，多取的每一个字节都在跟播放抢带宽）
+        req.headers.set(HttpHeaders.rangeHeader, 'bytes=0-262143');
+
+        final resp =
+            await req.close().timeout(const Duration(milliseconds: 4000));
+        if (resp.statusCode == HttpStatus.partialContent ||
+            resp.statusCode == HttpStatus.ok) {
+          final builder = BytesBuilder(copy: false);
+          await for (final chunk in resp) {
+            builder.add(chunk);
+            if (builder.length >= 256 * 1024) break;
+          }
+          final bytes = builder.takeBytes();
+          if (bytes.isNotEmpty) {
+            final sidx = SidxParser.parseSidx(bytes, 0);
+            if (sidx != null && sidx.segments.isNotEmpty) {
+              SidxCache.put(urlKey, sidx);
+              BtrLog.log(
+                '[BTR] sidx 预取解析成功: host=${BtrLog.hostOf(targetUrl)}, 分段数=${sidx.segments.length}',
+              );
+            }
+          }
+        } else {
+          await resp.drain<void>().catchError((_) {});
+        }
+      } catch (e) {
+        // 预取失败绝不影响正常播放
+        BtrLog.rateLimitedLog(
+          'sidx_prefetch_err',
+          '[BTR] sidx 后台预取跳过: host=${BtrLog.hostOf(targetUrl)} ($e)',
+        );
+      } finally {
+        _inFlightSidxPrefetches.remove(urlKey);
       }
     }());
   }
@@ -1108,6 +1328,7 @@ class BtrProxyServer {
     required int start,
     required Map<String, String> defaultHeaders,
     required CancellationToken token,
+    CdnPool? pool,
   }) async {
     token.throwIfCancelled();
     final client = _getOrCreateHttpClient();
@@ -1132,6 +1353,7 @@ class BtrProxyServer {
           final parsed = int.tryParse(tail);
           if (parsed != null && parsed > 0) {
             total = parsed;
+            pool?.checkTotalLengthConsistency(total, BtrLog.hostOf(targetUrl));
           }
         }
       }
