@@ -8,7 +8,7 @@
 海外看 B 站，冷门视频 / 4K 经常「一直转圈、加载卡死」。原因不是本地带宽，而是
 **单条 TCP 连接被 CDN 限速**（实测每条连接 0.05~0.5 MB/s 很常见）。
 
-[Bilibili-thread-ripper](https://github.com/Neko-77/Bilibili-thread-ripper)（BTR）在浏览器里解决了这个问题
+[Bilibili-thread-ripper](https://github.com/MrTangLuyao/Bilibili-thread-ripper)（BTR）在浏览器里解决了这个问题
 （改 MSE/DASH 层做多 Range 并发）。但安卓客户端是 Kotlin/Dart + ExoPlayer/mpv，**JS 塞不进去**。
 
 ## 2. 架构选择：本地 HTTP 代理

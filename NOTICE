@@ -20,11 +20,11 @@ BTR 多 Range 并发加速（PiliPlus 移植）
    （完整逐次改动见本仓库的 git 提交历史）
 
 2) Bilibili-thread-ripper —— 并发下载原理与参数参考（未复制其源码）
-   版权归其作者 Neko-77 所有
+   版权归其作者 MrTangLuyao 所有
    许可：MIT License
    来源：
-     - 网页版   https://github.com/Neko-77/Bilibili-thread-ripper
-     - 桌面版   https://github.com/Neko-77/bilibili-thread-ripper-desktop
+     - 网页版   https://github.com/MrTangLuyao/Bilibili-thread-ripper
+     - 桌面版   https://github.com/MrTangLuyao/bilibili-thread-ripper-desktop
 
    本移植是用 Dart 独立实现的（本地代理架构，与浏览器方案的实现路径不同），
    参考的是其公开文档中的原理与默认参数（并发推荐值、分块大小、hedge 延迟、预读秒数等）。

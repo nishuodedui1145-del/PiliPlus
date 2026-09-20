@@ -1,6 +1,6 @@
 # BTR 多 Range 并发加速 · PiliPlus 移植
 
-> 把 [Bilibili-thread-ripper](https://github.com/Neko-77/Bilibili-thread-ripper)（BTR，浏览器扩展/桌面版）的
+> 把 [Bilibili-thread-ripper](https://github.com/MrTangLuyao/Bilibili-thread-ripper)（BTR，浏览器扩展/桌面版）的
 > **多 Range 并发下载**原理移植到 [PiliPlus](https://github.com/bggRGjQaUbCoE/PiliPlus)（Flutter 版 B 站客户端）。
 >
 > 解决场景：**海外**看 B 站冷门视频 / 4K 时，单条连接被 CDN 限速导致「一直转圈、加载卡死」。
@@ -80,8 +80,8 @@ flutter test --no-pub test/standalone/btr_proxy_e2e_test.dart      # 端到端�
   → **本仓库同样以 GPL-3.0 发布**，`LICENSE` 保持不变。修改内容：新增本地 HTTP 代理与多 Range 并发下载模块
   （`lib/services/btr_proxy/`）、少量播放页与设置项接线（见提交历史）。
 - 并发下载的**原理与参数**参考自 **Bilibili-thread-ripper**（网页版与桌面版，**MIT** 许可）：
-  - 网页版：https://github.com/Neko-77/Bilibili-thread-ripper
-  - 桌面版：https://github.com/Neko-77/bilibili-thread-ripper-desktop
+  - 网页版：https://github.com/MrTangLuyao/Bilibili-thread-ripper
+  - 桌面版：https://github.com/MrTangLuyao/Bilibili-thread-ripper-desktop
   - 本移植为**独立实现**（Dart，本地代理架构），未直接复制其 JS 代码；参数默认值（并发 8、分块 64KB、hedge、bufferAhead 等）参照其文档。
 - 感谢上游 PiliPlus 作者与 BTR 作者。
 

@@ -1,7 +1,7 @@
 <div align="center">
     <img width="180" height="180" src="assets/images/logo/logo.png">
     <h1>PiliPlus + BTR 多线程加速</h1>
-    <p>把 <a href="https://github.com/Neko-77/Bilibili-thread-ripper">Bilibili-thread-ripper</a> 的<b>多 Range 并发下载</b>移植进 PiliPlus（Flutter 开发的 B 站第三方客户端）</p>
+    <p>把 <a href="https://github.com/MrTangLuyao/Bilibili-thread-ripper">Bilibili-thread-ripper</a> 的<b>多 Range 并发下载</b>移植进 PiliPlus（Flutter 开发的 B 站第三方客户端）</p>
 </div>
 
 > ### ⚠️ 这是个人 fork，不是官方仓库
@@ -74,8 +74,8 @@ flutter test --no-pub test/standalone/btr_proxy_e2e_test.dart      # 端到端�
 ## 许可
 
 - 本仓库是 PiliPlus 的衍生作品，**整体沿用上游的 GPL-3.0**（见 [LICENSE](LICENSE)，未改动）。
-- 并发下载的原理与默认参数参考 **Bilibili-thread-ripper**（[网页版](https://github.com/Neko-77/Bilibili-thread-ripper) /
-  [桌面版](https://github.com/Neko-77/bilibili-thread-ripper-desktop)，**MIT**）；本移植为 Dart 独立实现，未复制其 JS 代码。
+- 并发下载的原理与默认参数参考 **Bilibili-thread-ripper**（[网页版](https://github.com/MrTangLuyao/Bilibili-thread-ripper) /
+  [桌面版](https://github.com/MrTangLuyao/Bilibili-thread-ripper-desktop)，**MIT**）；本移植为 Dart 独立实现，未复制其 JS 代码。
   逐项改动说明与第三方署名见 **[NOTICE](NOTICE)**。
 
 ## 声明（沿用上游）
