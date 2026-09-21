@@ -1,3 +1,4 @@
+import 'package:PiliPlus/utils/extension/selectable_region_ext.dart';
 import 'package:material_ui/material_ui.dart';
 
 class SelectionText extends StatelessWidget {
@@ -35,7 +36,7 @@ class SelectionText extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return SelectionArea(
-      contextMenuBuilder: contextMenuBuilder,
+      contextMenuBuilder: openUrlMenuBuilder,
       child: Text.rich(
         style: style,
         textAlign: textAlign,
@@ -46,4 +47,13 @@ class SelectionText extends StatelessWidget {
       ),
     );
   }
+}
+
+Widget openUrlMenuBuilder(_, SelectableRegionState state) {
+  final buttonItems = state.contextMenuButtonItems;
+  state.addLaunchMenuIfNeeded(buttonItems, index: 3);
+  return AdaptiveTextSelectionToolbar.buttonItems(
+    buttonItems: buttonItems,
+    anchors: state.contextMenuAnchors,
+  );
 }

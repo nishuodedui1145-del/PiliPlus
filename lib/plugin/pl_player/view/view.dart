@@ -41,7 +41,6 @@ import 'package:PiliPlus/plugin/pl_player/models/data_status.dart';
 import 'package:PiliPlus/plugin/pl_player/models/double_tap_type.dart';
 import 'package:PiliPlus/plugin/pl_player/models/fullscreen_mode.dart';
 import 'package:PiliPlus/plugin/pl_player/models/gesture_type.dart';
-import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/plugin/pl_player/models/video_fit_type.dart';
 import 'package:PiliPlus/plugin/pl_player/widgets/app_bar_ani.dart';
 import 'package:PiliPlus/plugin/pl_player/widgets/backward_seek.dart';
@@ -1865,10 +1864,8 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
                             size: 20,
                             color: Colors.white,
                           ),
-                          onLongPress: !PlatformUtils.isDarwin && !isLive
-                              ? _screenshotWebp
-                              : null,
-                          onSecondaryTap: !PlatformUtils.isDarwin && !isLive
+                          onLongPress:
+                              (Platform.isAndroid || kDebugMode) && !isLive
                               ? _screenshotWebp
                               : null,
                           onTap: plPlayerController.takeScreenshot,

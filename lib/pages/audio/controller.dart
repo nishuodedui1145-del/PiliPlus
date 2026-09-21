@@ -23,13 +23,12 @@ import 'package:PiliPlus/pages/common/common_intro_controller.dart'
     show FavMixin;
 import 'package:PiliPlus/pages/dynamics_repost/view.dart';
 import 'package:PiliPlus/pages/main_reply/view.dart';
-import 'package:PiliPlus/pages/setting/models/play_settings.dart'
-    show kMaxVolume;
 import 'package:PiliPlus/pages/sponsor_block/block_mixin.dart';
 import 'package:PiliPlus/pages/video/controller.dart';
 import 'package:PiliPlus/pages/video/introduction/ugc/widgets/triple_mixin.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_repeat.dart';
+import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/services/service_locator.dart';
 import 'package:PiliPlus/services/shutdown_timer_service.dart';
 import 'package:PiliPlus/utils/accounts.dart';
@@ -90,6 +89,14 @@ class AudioController extends GetxController
 
   late double speed = 1.0;
 
+  void setSpeed(double value) {
+    if (player case final player?) {
+      speed = value;
+      player.setRate(value);
+      _updatePlaybackState();
+    }
+  }
+
   late final Rx<PlayRepeat> playMode = Pref.audioPlayMode.obs;
 
   @override
@@ -108,6 +115,15 @@ class AudioController extends GetxController
   late final RxDouble desktopVolume = RxDouble(Pref.desktopVolume);
 
   Timer? _statusTimer;
+
+  void _startStatusTimer() {
+    _statusTimer?.cancel();
+    _statusTimer = Timer(
+      const Duration(milliseconds: 500),
+      _updatePlaybackState,
+    );
+  }
+
   void _stopStatusTimer() {
     _statusTimer?.cancel();
     _statusTimer = null;
@@ -208,6 +224,7 @@ class AudioController extends GetxController
   }
 
   Future<void>? onSeek(Duration duration) {
+    _updatePlaybackState(position: duration);
     return player?.seek(duration);
   }
 
@@ -356,6 +373,18 @@ class AudioController extends GetxController
     _start = null;
   }
 
+  PlayerStatus _playerStatus = .paused;
+  void _updatePlaybackState({Duration? position, String? debugLabel}) {
+    videoPlayerServiceHandler?.onUpdateState(
+      _playerStatus,
+      false,
+      false,
+      position: position ?? player!.state.position,
+      speed: speed,
+      debugLabel: debugLabel,
+    );
+  }
+
   Future<void> _initPlayerIfNeeded() async {
     if (_hasInit) return;
     _hasInit = true;
@@ -367,7 +396,6 @@ class AudioController extends GetxController
           'volume': PlatformUtils.isDesktop
               ? (desktopVolume.value * 100).toString()
               : Pref.playerVolume.toString(),
-          'volume-max': kMaxVolume.toString(),
           ...Pref.initBuffer(),
         },
       ),
@@ -382,10 +410,12 @@ class AudioController extends GetxController
       stream.position.listen((position) {
         if (isDragging) return;
         final seconds = position.inSeconds;
+        if (seconds == 0 && _playerStatus.isPlaying) {
+          _updatePlaybackState(position: position);
+        }
         if (seconds != this.position.value) {
           this.position.value = seconds;
           _videoDetailController?.playedTime = position;
-          videoPlayerServiceHandler?.onPositionChange(position);
         }
       }),
       stream.duration.listen((duration) {
@@ -394,27 +424,23 @@ class AudioController extends GetxController
       stream.playing.listen((playing) {
         if (playing) {
           animController.forward();
+          _playerStatus = .playing;
           _stopStatusTimer();
-          videoPlayerServiceHandler?.onStatusChange(.playing, false, false);
+          _updatePlaybackState();
         } else {
           animController.reverse();
-          _statusTimer?.cancel();
-          _statusTimer = Timer(
-            const Duration(milliseconds: 500),
-            () => videoPlayerServiceHandler?.onStatusChange(
-              .paused,
-              false,
-              false,
-            ),
-          );
+          _playerStatus = .paused;
+          _startStatusTimer();
         }
       }),
       stream.buffering.listen((buffering) {
-        if (buffering) _stopStatusTimer();
+        if (buffering && !player!.state.completed) _stopStatusTimer();
       }),
       stream.completed.listen((completed) {
         _videoDetailController?.playedTime = player!.state.duration;
         if (completed) {
+          _playerStatus = .completed;
+          _startStatusTimer();
           if (shutdownTimerService.isWaiting) {
             shutdownTimerService.handleWaiting();
           } else {
@@ -729,13 +755,6 @@ class AudioController extends GetxController
         _updateCurrItem(audioItem);
       }
     });
-  }
-
-  void setSpeed(double speed) {
-    if (player case final player?) {
-      this.speed = speed;
-      player.setRate(speed);
-    }
   }
 
   @override
