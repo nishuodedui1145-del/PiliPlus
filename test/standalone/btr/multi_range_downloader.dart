@@ -175,6 +175,29 @@ class PrioritySemaphore {
       }
     }
   }
+
+  /// 取消排队等待中的全部请求
+  void cancelAll([Object? reason]) {
+    while (_queue.isNotEmpty) {
+      final entry = _queue.removeAt(0);
+      if (entry.token != null && entry.cancelListener != null) {
+        entry.token!.removeListener(entry.cancelListener!);
+      }
+      if (!entry.completer.isCompleted) {
+        entry.completer.completeError(
+          CancellationException(reason ?? 'PrioritySemaphore cancelled'),
+        );
+      }
+    }
+  }
+
+  /// 归零信号量状态（在途计数、排队队列、统计）
+  void reset() {
+    cancelAll('PrioritySemaphore reset');
+    _active = 0;
+    _totalAcquires = 0;
+    _totalReleases = 0;
+  }
 }
 
 class _SemaphoreEntry {
@@ -272,6 +295,16 @@ class MultiRangeDownloader {
     _semaphore.setLimit(_maxInFlightSockets);
   }
 
+  /// 广播取消下载器内所有排队任务
+  void cancelAll([Object? reason]) {
+    _semaphore.cancelAll(reason);
+  }
+
+  /// 归零调度器状态与信号量
+  void reset() {
+    _semaphore.reset();
+  }
+
   /// 单次 piece 下载尝试（包含独立首字节超时 5.5s、停滞 4s、总计 15s）
   Future<PieceResult> attempt({
     required RangePiece piece,
@@ -291,6 +324,7 @@ class MultiRangeDownloader {
     final innerToken = CancellationToken();
     void onParentCancel() => innerToken.cancel(token.reason);
     HttpClientRequest? currentRequest;
+    StreamSubscription<List<int>>? subscription;
     Timer? firstByteTimer;
     Timer? stallTimer;
     Timer? totalTimer;
@@ -324,11 +358,19 @@ class MultiRangeDownloader {
       final req = await _httpClient.getUrl(uri);
       currentRequest = req;
 
-      // 注册内层 token 中断
-      innerToken.addListener(req.abort);
+      // 注册内层 token 中断：必须同时 abort 请求并 cancel 响应流 (第 26 轮实证)
+      void onAbortAll() {
+        try {
+          currentRequest?.abort();
+        } catch (_) {}
+        try {
+          subscription?.cancel();
+        } catch (_) {}
+      }
+      innerToken.addListener(onAbortAll);
 
       if (innerToken.isCancelled) {
-        req.abort();
+        onAbortAll();
         throw CancellationException(innerToken.reason);
       }
 
@@ -414,7 +456,6 @@ class MultiRangeDownloader {
 
       armStallTimer();
 
-      late final StreamSubscription<List<int>> subscription;
       subscription = resp.listen(
         (chunkData) {
           if (!firstByteReceived) {
@@ -455,7 +496,7 @@ class MultiRangeDownloader {
         firstByteTimer?.cancel();
         totalTimer?.cancel();
         try {
-          subscription.cancel();
+          subscription?.cancel();
         } catch (_) {}
         if (!completer.isCompleted) {
           if (isFirstByteTimeout) {
@@ -579,6 +620,9 @@ class MultiRangeDownloader {
         innerToken.removeListener(onInnerCancel);
       }
       try {
+        subscription?.cancel();
+      } catch (_) {}
+      try {
         currentRequest?.abort();
       } catch (_) {}
       release();
@@ -596,6 +640,8 @@ class MultiRangeDownloader {
     bool Function()? isSlowPieceEligible,
     bool Function()? isHedgeAllowed,
     void Function(void Function() triggerHedge)? onHedgeReady,
+    int Function()? getHeadIndex,
+    double Function()? getAggregatedBps,
   }) async {
     token.throwIfCancelled();
 
@@ -671,6 +717,7 @@ class MultiRangeDownloader {
       Timer? hedgeTimer;
       Timer? pieceTimeoutTimer;
       bool road2Started = false;
+      final sw0 = Stopwatch();
 
       void checkAllDone() {
         if (activeCount == 0 && !completer.isCompleted) {
@@ -701,15 +748,51 @@ class MultiRangeDownloader {
           if (road2Started || completer.isCompleted || token.isCancelled) return;
           if (pair.length < 2) return;
 
-          // 任务 A：只有当前聚合吞吐 < 目标吞吐（即真的喂不动）时，才允许对慢块发起第二路（hedge）；
-          // 聚合已达标时，慢块只记日志、不抢路。
-          final isAllowed = isHedgeAllowed?.call() ?? true;
-          if (!isAllowed) {
+          final elapsedMs = sw0.elapsedMilliseconds;
+          final currentHead = getHeadIndex?.call() ?? 0;
+          // 2. 定义 Critical Window = [headIndex, headIndex+1]（队头起 2 块），其余为 Prefetch
+          final isCritical = startupMode ||
+              (piece.index >= currentHead && piece.index <= currentHead + 1);
+
+          if (isCritical) {
+            // 3. Critical：耗时 ≥ 现有慢块阈值（用现有阈值变量，不要硬编码 1200ms）→ 无条件触发第二路对冲，跳过聚合判据
+            if (elapsedMs < slowThreshold.inMilliseconds) {
+              Timer(
+                Duration(milliseconds: slowThreshold.inMilliseconds - elapsedMs),
+                () {
+                  if (!road2Started && !completer.isCompleted && !token.isCancelled) {
+                    launchRoad2();
+                  }
+                },
+              );
+              return;
+            }
             BtrLog.rateLimitedLog(
-              'hedge_skip_${piece.index}',
-              '[BTR] 慢块但聚合已达标，不抢第二路 piece#${piece.index}',
+              'hedge_critical_${piece.index}',
+              '[BTR] 队头块强制对冲 piece#${piece.index}（耗时 ${elapsedMs}ms，窗口内）',
             );
-            return;
+          } else {
+            // 3. Prefetch：保留聚合判据，但判据改为相对码率：仅当 聚合速率 < 目标码率 × 1.5 时才允许对冲
+            final currentAggBps = getAggregatedBps?.call() ?? 0.0;
+            final baseTargetBps =
+                RangeCore.requiredThroughputBytesPerSec(pool.videoBitrateBytesPerSec);
+            final targetBps = max(baseTargetBps, RangeCore.singleAdequateFallbackBps);
+            final hedgeTargetBps = targetBps * 1.5;
+
+            final isAllowed = isHedgeAllowed?.call() ?? (currentAggBps < hedgeTargetBps);
+            if (!isAllowed || currentAggBps >= hedgeTargetBps) {
+              BtrLog.rateLimitedLog(
+                'hedge_skip_${piece.index}',
+                '[BTR] 慢块但聚合已达标，不抢第二路 piece#${piece.index}',
+              );
+              return;
+            }
+
+            final currentAggMbps = (currentAggBps / (1024 * 1024)).toStringAsFixed(2);
+            BtrLog.rateLimitedLog(
+              'hedge_prefetch_${piece.index}',
+              '[BTR] 预取块对冲piece#${piece.index}（聚合 $currentAggMbps MB/s < 码率×1.5）',
+            );
           }
 
           // P2-13: 必须在真正发起第二路时才置位 road2Started，否则该分块永久失去 hedge 机会
@@ -772,7 +855,7 @@ class MultiRangeDownloader {
 
         // 启动第一路
         activeCount++;
-        final sw0 = Stopwatch()..start();
+        sw0.start();
         attempt(
           piece: piece,
           url: pair[0],
@@ -822,11 +905,9 @@ class MultiRangeDownloader {
             hedgeTimer = Timer(RangeCore.startupHedgeDelay, launchRoad2);
           } else {
             onHedgeReady?.call(launchRoad2);
-            final effectiveDelay = slowThreshold < RangeCore.hedgeDelay
-                ? slowThreshold
-                : RangeCore.hedgeDelay;
+            final effectiveDelay = slowThreshold;
             hedgeTimer = Timer(effectiveDelay, () {
-              if (isSlowPieceEligible?.call() == true) {
+              if (isSlowPieceEligible?.call() ?? true) {
                 launchRoad2();
               }
             });
@@ -872,6 +953,8 @@ class MultiRangeDownloader {
     bool Function()? isSlowPieceEligible,
     bool Function()? isHedgeAllowed,
     void Function(void Function() triggerHedge)? onHedgeReady,
+    int Function()? getHeadIndex,
+    double Function()? getAggregatedBps,
   }) async {
     final winner = await _downloadPieceInternal(
       piece: piece,
@@ -883,6 +966,8 @@ class MultiRangeDownloader {
       isSlowPieceEligible: isSlowPieceEligible,
       isHedgeAllowed: isHedgeAllowed,
       onHedgeReady: onHedgeReady,
+      getHeadIndex: getHeadIndex,
+      getAggregatedBps: getAggregatedBps,
     );
 
     if (winner.actualEnd >= piece.end) {
@@ -941,6 +1026,8 @@ class MultiRangeDownloader {
         isSlowPieceEligible: isSlowPieceEligible,
         isHedgeAllowed: isHedgeAllowed,
         onHedgeReady: onHedgeReady,
+        getHeadIndex: getHeadIndex,
+        getAggregatedBps: getAggregatedBps,
       );
 
       allChunks.add(subRes.bytes);
@@ -978,10 +1065,18 @@ class MultiRangeDownloader {
     for (final url in targetUrls) {
       if (token.isCancelled) return null;
       HttpClientRequest? req;
+      StreamSubscription<List<int>>? respSub;
+      final drainCompleter = Completer<void>();
       void onCancel() {
         try {
           req?.abort();
         } catch (_) {}
+        try {
+          respSub?.cancel();
+        } catch (_) {}
+        if (!drainCompleter.isCompleted) {
+          drainCompleter.complete();
+        }
       }
 
       final release = await acquireSocket(token, priority: 200, caller: 'probe_head_fast');
@@ -1000,7 +1095,17 @@ class MultiRangeDownloader {
 
         final resp =
             await req.close().timeout(const Duration(milliseconds: 3000));
-        await resp.drain<void>().catchError((_) {});
+        respSub = resp.listen(
+          (_) {},
+          onError: (_) {
+            if (!drainCompleter.isCompleted) drainCompleter.complete();
+          },
+          onDone: () {
+            if (!drainCompleter.isCompleted) drainCompleter.complete();
+          },
+          cancelOnError: true,
+        );
+        await drainCompleter.future;
 
         if (resp.statusCode == HttpStatus.ok) {
           final cl = resp.headers.contentLength;
@@ -1027,6 +1132,12 @@ class MultiRangeDownloader {
         BtrLog.log('[BTR] HEAD probe failed on ${BtrLog.hostOf(url)}: ${BtrLog.redact(e)}');
       } finally {
         token.removeListener(onCancel);
+        try {
+          respSub?.cancel();
+        } catch (_) {}
+        if (!drainCompleter.isCompleted) {
+          drainCompleter.complete();
+        }
         release();
       }
     }
@@ -1739,21 +1850,35 @@ class _SlidingWindowStreamer {
     });
   }
 
+  int _calculateHeadIndex() {
+    if (_headOfLineStartTimes.isNotEmpty) {
+      return _headOfLineStartTimes.keys.reduce(min);
+    }
+    return _nextFlushIndex;
+  }
+
   void _checkHeadOfLineHedge() {
     if (_completer.isCompleted || token.isCancelled || _isDegraded) return;
-    final index = _nextFlushIndex;
-    final startTime = _inFlightStartTimes[index];
-    if (startTime == null) return;
-    final elapsedMs = DateTime.now().millisecondsSinceEpoch - startTime;
-    final thresholdMs = pool.slowPieceThreshold.inMilliseconds;
-    if (elapsedMs >= thresholdMs) {
-      _inFlightHedgeLaunchers[index]?.call();
-    } else {
-      Timer(Duration(milliseconds: thresholdMs - elapsedMs), () {
-        if (_nextFlushIndex == index && !_completedPieces.containsKey(index)) {
-          _inFlightHedgeLaunchers[index]?.call();
-        }
-      });
+    final head = _calculateHeadIndex();
+    // Critical Window = [headIndex, headIndex + 1]
+    for (final index in [head, head + 1]) {
+      if (index >= pieces.length) continue;
+      if (_completedPieces.containsKey(index)) continue;
+      final startTime = _inFlightStartTimes[index];
+      if (startTime == null) continue;
+      final elapsedMs = DateTime.now().millisecondsSinceEpoch - startTime;
+      final thresholdMs = pool.slowPieceThreshold.inMilliseconds;
+      if (elapsedMs >= thresholdMs) {
+        _inFlightHedgeLaunchers[index]?.call();
+      } else {
+        Timer(Duration(milliseconds: thresholdMs - elapsedMs), () {
+          final currentHead = _calculateHeadIndex();
+          if ((index == currentHead || index == currentHead + 1) &&
+              !_completedPieces.containsKey(index)) {
+            _inFlightHedgeLaunchers[index]?.call();
+          }
+        });
+      }
     }
   }
 
@@ -1786,11 +1911,14 @@ class _SlidingWindowStreamer {
         startupMode: false,
         // 距离当前 flush 游标越近的分块优先级越高
         priority: max(10, 100 - (index - _nextFlushIndex) * 5),
-        isSlowPieceEligible: () => _nextFlushIndex == index,
+        isSlowPieceEligible: () => true,
         isHedgeAllowed: () => isAggregateBelowTarget,
+        getHeadIndex: _calculateHeadIndex,
+        getAggregatedBps: getCurrentAggregatedBps,
         onHedgeReady: (launcher) {
           _inFlightHedgeLaunchers[index] = launcher;
-          if (_nextFlushIndex == index) {
+          final head = _calculateHeadIndex();
+          if (index == head || index == head + 1) {
             _checkHeadOfLineHedge();
           }
         },

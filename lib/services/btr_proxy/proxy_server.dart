@@ -137,6 +137,17 @@ class BtrProxyServer {
     BtrLog.log(
       '[BTR] 代理生命周期: 事件=scheduleStop 端口=${_server?.port ?? 0} 在途=${_activeTokens.length}',
     );
+    // 收到停止指令时广播取消旧视频的在途请求，以便在延迟期内自然退出并归零
+    for (final token in List.of(_activeTokens)) {
+      try {
+        token.cancel('收到停止指令 (scheduleStop)');
+      } catch (_) {}
+    }
+    for (final downloader in _downloaderCache.values) {
+      try {
+        downloader.cancelAll('收到停止指令 (scheduleStop)');
+      } catch (_) {}
+    }
     _scheduledStopTimer = Timer(delay, () {
       _scheduledStopTimer = null;
       stop(force: false);
@@ -216,10 +227,23 @@ class BtrProxyServer {
     if (!force) {
       final inFlight = _activeTokens.length;
       if (inFlight > 0) {
+        // 广播取消所有在途请求 (复用现有 CancellationToken)
+        for (final token in List.of(_activeTokens)) {
+          try {
+            token.cancel('代理停止: 广播取消在途请求');
+          } catch (_) {}
+        }
+        for (final downloader in _downloaderCache.values) {
+          try {
+            downloader.cancelAll('代理停止: 广播取消在途请求');
+          } catch (_) {}
+        }
+
+        // 宽限期：给 1 次判定（3秒）等待在途自然退出
         if (_stopRetryCount < _maxStopRetries) {
           _stopRetryCount++;
           BtrLog.log(
-            '[BTR] 代理停止跳过: 仍有在途请求 ($inFlight 个)，第 $_stopRetryCount/$_maxStopRetries 次重排',
+            '[BTR] 代理停止: 已广播取消在途 ($inFlight 个)，等待宽限期 (3s) 自然退出，第 $_stopRetryCount 次判定',
           );
           _scheduledStopTimer = Timer(const Duration(seconds: 3), () {
             _scheduledStopTimer = null;
@@ -228,11 +252,11 @@ class BtrProxyServer {
           return;
         } else {
           BtrLog.log(
-            '[BTR] 代理强制停止: 在途=$inFlight 超时',
+            '[BTR] 代理强制停止: 在途=$inFlight 宽限期耗尽',
           );
           for (final token in List.of(_activeTokens)) {
             try {
-              token.cancel('代理强制停止: 在途超时');
+              token.cancel('代理强制停止: 宽限期耗尽');
             } catch (e) {
               BtrLog.log('[BTR] 强制取消在途连接异常: ${BtrLog.redact(e)}');
             }
@@ -245,7 +269,7 @@ class BtrProxyServer {
           if (_stopRetryCount < _maxStopRetries) {
             _stopRetryCount++;
             BtrLog.log(
-              '[BTR] 代理停止跳过: 最近 ${(now - _lastRequestTimestamp)}ms 内有活跃请求，第 $_stopRetryCount/$_maxStopRetries 次重排',
+              '[BTR] 代理停止跳过: 最近 ${(now - _lastRequestTimestamp)}ms 内有活跃请求，第 $_stopRetryCount 次重排',
             );
             _scheduledStopTimer = Timer(const Duration(seconds: 3), () {
               _scheduledStopTimer = null;
@@ -291,6 +315,8 @@ class BtrProxyServer {
         }
       } finally {
         resetForNewVideo();
+        _httpClient?.close(force: true);
+        _httpClient = null;
         _stopping = null;
         BtrLog.log(
           '[BTR] 代理停止: 端口=$port 在途响应=$inFlight 强制=${forced ? '是' : '否'}',
@@ -305,7 +331,7 @@ class BtrProxyServer {
     return stopping;
   }
 
-  /// 切视频或退出时重置所有活跃请求与缓存，释放复用的 HttpClient 连接池
+  /// 切视频或退出时重置所有活跃请求与缓存
   void resetForNewVideo() {
     _scheduledStopTimer?.cancel();
     _scheduledStopTimer = null;
@@ -314,11 +340,18 @@ class BtrProxyServer {
       '[BTR] 代理生命周期: 事件=reset 端口=${_server?.port ?? 0} 在途=${_activeTokens.length}',
     );
     for (final token in List.of(_activeTokens)) {
-      token.cancel('Video reset / page closed');
+      try {
+        token.cancel('Video reset / page closed');
+      } catch (_) {}
     }
     _activeTokens.clear();
+    for (final downloader in _downloaderCache.values) {
+      try {
+        downloader..cancelAll('Video reset / page closed')..reset();
+      } catch (_) {}
+    }
     for (final pool in _cdnPoolCache.values) {
-      pool.clearRacerHint();
+      pool..clearRacerHint()..reset();
     }
     _cdnPoolCache.clear();
     _rangeUnsupportedUrls.clear();
@@ -329,8 +362,7 @@ class BtrProxyServer {
     _lastConfiguredConcurrency = null;
     socketBudget.reset();
     _inFlightSidxPrefetches.clear();
-    _httpClient?.close(force: true);
-    _httpClient = null;
+    // ⚠️ 保持复用共享的 _httpClient，不在此处 close(force: true)，保证跨视频 keep-alive 连接不被销毁
     _lastRequestTimestamp = 0;
     lastSampleUrl = null;
     lastGroup = null;
@@ -1453,38 +1485,82 @@ class BtrProxyServer {
     CdnPool? pool,
   }) async {
     token.throwIfCancelled();
-    final client = _getOrCreateHttpClient();
-    final req = await client.openUrl('GET', Uri.parse(targetUrl));
-    defaultHeaders.forEach((k, v) {
-      req.headers.set(k, v);
-    });
-    req.headers.set(HttpHeaders.rangeHeader, 'bytes=$start-$start');
-    final resp = await req.close().timeout(RangeCore.primerFetchTimeout);
-    if (resp.statusCode >= 400) {
-      throw UpstreamHttpException(resp.statusCode, '首字节探测请求失败');
+    HttpClientRequest? req;
+    StreamSubscription<List<int>>? respSub;
+    final completer = Completer<({Uint8List bytes, int? total})>();
+
+    void onCancel() {
+      try {
+        req?.abort();
+      } catch (_) {}
+      try {
+        respSub?.cancel();
+      } catch (_) {}
+      if (!completer.isCompleted) {
+        completer.completeError(CancellationException(token.reason));
+      }
     }
-    // 顺手把总长度捞回来（Content-Range: bytes N-N/总长度）：
-    // 有它才能给播放器回精确的 206，否则 mpv 会 Seek failed（size 未知）。
-    int? total;
-    final contentRange = resp.headers.value(HttpHeaders.contentRangeHeader);
-    if (contentRange != null) {
-      final slash = contentRange.lastIndexOf('/');
-      if (slash > 0) {
-        final tail = contentRange.substring(slash + 1).trim();
-        if (tail.isNotEmpty && tail != '*') {
-          final parsed = int.tryParse(tail);
-          if (parsed != null && parsed > 0) {
-            total = parsed;
-            pool?.checkTotalLengthConsistency(total, BtrLog.hostOf(targetUrl));
+
+    try {
+      token..addListener(onCancel)..throwIfCancelled();
+      final client = _getOrCreateHttpClient();
+      req = await client.openUrl('GET', Uri.parse(targetUrl));
+      if (token.isCancelled) {
+        req.abort();
+        token.throwIfCancelled();
+      }
+      defaultHeaders.forEach((k, v) {
+        req!.headers.set(k, v);
+      });
+      req.headers.set(HttpHeaders.rangeHeader, 'bytes=$start-$start');
+      final resp = await req.close().timeout(RangeCore.primerFetchTimeout);
+      if (token.isCancelled) {
+        req.abort();
+        token.throwIfCancelled();
+      }
+      if (resp.statusCode >= 400) {
+        throw UpstreamHttpException(resp.statusCode, '首字节探测请求失败');
+      }
+      // 顺手把总长度捞回来（Content-Range: bytes N-N/总长度）：
+      // 有它才能给播放器回精确的 206，否则 mpv 会 Seek failed（size 未知）。
+      int? total;
+      final contentRange = resp.headers.value(HttpHeaders.contentRangeHeader);
+      if (contentRange != null) {
+        final slash = contentRange.lastIndexOf('/');
+        if (slash > 0) {
+          final tail = contentRange.substring(slash + 1).trim();
+          if (tail.isNotEmpty && tail != '*') {
+            final parsed = int.tryParse(tail);
+            if (parsed != null && parsed > 0) {
+              total = parsed;
+              pool?.checkTotalLengthConsistency(total, BtrLog.hostOf(targetUrl));
+            }
           }
         }
       }
+      final builder = BytesBuilder(copy: false);
+      respSub = resp.listen(
+        builder.add,
+        onError: (err) {
+          if (!completer.isCompleted) completer.completeError(err);
+        },
+        onDone: () {
+          if (!completer.isCompleted) {
+            completer.complete((bytes: builder.takeBytes(), total: total));
+          }
+        },
+        cancelOnError: true,
+      );
+      return await completer.future;
+    } finally {
+      token.removeListener(onCancel);
+      try {
+        respSub?.cancel();
+      } catch (_) {}
+      try {
+        req?.abort();
+      } catch (_) {}
     }
-    final builder = BytesBuilder(copy: false);
-    await for (final chunk in resp) {
-      builder.add(chunk);
-    }
-    return (bytes: builder.takeBytes(), total: total);
   }
 
   /// 已发送响应头之后的"纯数据"透传（probeHead 超时兜底路径专用）：

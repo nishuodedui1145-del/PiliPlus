@@ -23,6 +23,12 @@ const double kUnknownBitrateFallbackBps = 1.0 * 1024 * 1024;
 /// 粘性节点解绑速度门限倍数：实测速度低于「码率 × 该倍数」即解绑
 const double kStickySpeedMargin = 1.2;
 
+/// 粘性节点速度衰减解绑门限倍数（连续 3 次低于「码率 × 1.5」熔断）
+const double kStickyDecayBitrateMargin = 1.5;
+const int kStickyDecayConsecutiveLimit = 3;
+const double kStickyDecayPeakRatio = 0.25;
+const int kStickyDecayPeakDurationMs = 10000;
+
 /// 负责记录并封禁坏节点（对齐官方 cdn-resolver.js:125-146 node / address / pair 三级封禁）
 class CdnBanList {
   final int strikeLimit;
@@ -466,6 +472,14 @@ class CdnPool {
   String? _stickyUrl;
   String? get stickyUrl => isAnchorEligible() ? anchorUrl : _stickyUrl;
 
+  /// 粘性节点速度衰减追踪状态
+  int _stickyLowSpeedStrikes = 0;
+  double _stickyPeakBps = 0.0;
+  int? _stickyPeakDropStartMs;
+
+  int get stickyLowSpeedStrikes => _stickyLowSpeedStrikes;
+  double get stickyPeakBps => _stickyPeakBps;
+
   /// BTR CDN 竞速提示信息
   String? _racerHintHost;
   String? _racerHintUrl;
@@ -693,6 +707,42 @@ class CdnPool {
     return speed >= minSpeed;
   }
 
+  /// 检查粘性节点是否触发速度衰减熔断
+  bool checkStickyDecay() {
+    final sticky = _stickyUrl;
+    if (sticky == null) return false;
+    final speed = _health[sticky]?.bps ?? 0.0;
+    final effectiveBitrate =
+        videoBitrateBytesPerSec ?? kUnknownBitrateFallbackBps;
+    final now = DateTime.now().millisecondsSinceEpoch;
+
+    final isBelowBitrate =
+        _stickyLowSpeedStrikes >= kStickyDecayConsecutiveLimit;
+    final isBelowPeakQuarter = _stickyPeakBps > 0 &&
+        _stickyPeakDropStartMs != null &&
+        (now - _stickyPeakDropStartMs!) >= kStickyDecayPeakDurationMs;
+
+    if (isBelowBitrate || isBelowPeakQuarter) {
+      final host = CdnBanList.hostOf(sticky);
+      final avgMbps = (speed / (1024 * 1024)).toStringAsFixed(2);
+      final bitrateMbps = (effectiveBitrate / (1024 * 1024)).toStringAsFixed(2);
+      final consecutive = _stickyLowSpeedStrikes;
+      BtrLog.log(
+        '[BTR] 粘性节点衰减熔断: host=$host 滑动均值=$avgMbps MB/s 码率=$bitrateMbps MB/s 连续=$consecutive 次',
+      );
+      _stickyUrl = null;
+      _stickyLowSpeedStrikes = 0;
+      _stickyPeakBps = 0.0;
+      _stickyPeakDropStartMs = null;
+      if (_racerHintUrl == sticky ||
+          CdnBanList.hostOf(_racerHintUrl ?? '') == host) {
+        clearRacerHint();
+      }
+      return true;
+    }
+    return false;
+  }
+
   /// 判定粘性节点是否依然可用
   bool isStickyValid(String? url) {
     if (url == null || url.isEmpty) return false;
@@ -701,6 +751,8 @@ class CdnPool {
     if (!isUsable(url)) return false;
     // ③ 该节点被临时阻断
     if (_health[url]?.isBlocked(now) ?? false) return false;
+    // 衰减熔断判定（连续低于码率×1.5 或 低于历史峰值25%持续10秒）
+    if (url == _stickyUrl && checkStickyDecay()) return false;
     // ② 该节点实测速度掉到"视频码率的 1.2 倍"以下
     //    码率参数(bw)缺失时用保守兜底值：宁可多切节点，也不要锁死在慢节点上。
     final minSpeed =
@@ -713,6 +765,11 @@ class CdnPool {
   /// 设置本次视频的粘性节点
   void setStickyUrl(String url) {
     if (isStickyValid(url)) {
+      if (_stickyUrl != url) {
+        _stickyLowSpeedStrikes = 0;
+        _stickyPeakBps = _health[url]?.bps ?? 0.0;
+        _stickyPeakDropStartMs = null;
+      }
       _stickyUrl = url;
     }
   }
@@ -1088,11 +1145,36 @@ class CdnPool {
   /// 记录节点请求成功与瞬时速度
   void success(String url, double bps) {
     final currentBps = _health[url]?.bps ?? 0.0;
+    final newBps = currentBps > 0 ? (currentBps * 0.65 + bps * 0.35) : bps;
     _health.putIfAbsent(url, CdnNodeHealth.new)
       ..failures = 0
       ..blockedUntil = 0
       ..lastSuccessAt = DateTime.now().millisecondsSinceEpoch
-      ..bps = currentBps > 0 ? (currentBps * 0.65 + bps * 0.35) : bps;
+      ..bps = newBps;
+
+    // 若当前为粘性节点，更新衰减统计并检查熔断
+    final sticky = _stickyUrl;
+    if (sticky != null &&
+        (url == sticky || CdnBanList.hostOf(url) == CdnBanList.hostOf(sticky))) {
+      final effectiveBitrate =
+          videoBitrateBytesPerSec ?? kUnknownBitrateFallbackBps;
+      if (newBps < effectiveBitrate * kStickyDecayBitrateMargin) {
+        _stickyLowSpeedStrikes++;
+      } else {
+        _stickyLowSpeedStrikes = 0;
+      }
+
+      if (newBps > _stickyPeakBps) {
+        _stickyPeakBps = newBps;
+      }
+      if (_stickyPeakBps > 0 && newBps < _stickyPeakBps * kStickyDecayPeakRatio) {
+        _stickyPeakDropStartMs ??= DateTime.now().millisecondsSinceEpoch;
+      } else {
+        _stickyPeakDropStartMs = null;
+      }
+
+      checkStickyDecay();
+    }
   }
 
   /// 记录节点请求失败（若非主动取消且非 Range 不支持，按指数退避临时阻断，并累加 0 字节惩罚）
@@ -1116,6 +1198,9 @@ class CdnPool {
     _mediaRangeCount = 0;
     adaptiveConcurrency = null;
     _stickyUrl = null;
+    _stickyLowSpeedStrikes = 0;
+    _stickyPeakBps = 0.0;
+    _stickyPeakDropStartMs = null;
     hasSpeedTested = false;
     _activeGroup = preferredGroup ?? CdnGroup.mainland;
     _groupDecided = preferredGroup != null;
