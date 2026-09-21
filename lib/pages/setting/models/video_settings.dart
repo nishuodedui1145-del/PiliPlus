@@ -6,11 +6,13 @@ import 'package:PiliPlus/models/common/video/live_quality.dart';
 import 'package:PiliPlus/models/common/video/video_decode_type.dart';
 import 'package:PiliPlus/models/common/video/video_quality.dart';
 import 'package:PiliPlus/pages/setting/models/model.dart';
+import 'package:PiliPlus/pages/setting/widgets/btr_log_page.dart';
 import 'package:PiliPlus/pages/setting/widgets/ordered_multi_select_dialog.dart';
 import 'package:PiliPlus/pages/setting/widgets/select_dialog.dart';
 import 'package:PiliPlus/plugin/pl_player/models/audio_output_type.dart';
 import 'package:PiliPlus/plugin/pl_player/models/hwdec_type.dart';
 import 'package:PiliPlus/services/btr_proxy/proxy_server.dart';
+import 'package:PiliPlus/services/btr_proxy/range_core.dart';
 import 'package:PiliPlus/utils/filtering_text.dart';
 import 'package:PiliPlus/utils/storage.dart';
 import 'package:PiliPlus/utils/storage_key.dart';
@@ -125,6 +127,13 @@ List<SettingsModel> get videoSettings => [
         BtrProxyServer.instance.clearAllRacerHints();
       }
     },
+  ),
+  NormalModel(
+    title: 'BTR 日志',
+    leading: const Icon(Icons.article_outlined),
+    getSubtitle: () => '查看与导出 BTR 本地运行诊断日志（当前 ${BtrLog.length} 行）',
+    onTap: (context, setState) =>
+        Get.to(() => const BtrLogPage())?.then((_) => setState()),
   ),
   NormalModel(
     title: '默认画质',

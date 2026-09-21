@@ -1,7 +1,8 @@
+import 'dart:collection';
 import 'dart:math';
 import 'dart:typed_data';
 
-import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
+import 'package:flutter/foundation.dart' show debugPrint;
 
 /// 表示一个具体的字节区间
 class ByteRange {
@@ -460,9 +461,39 @@ abstract final class RangeCore {
   }
 }
 
-/// BTR 诊断埋点日志工具（支持限流与 URL 脱敏截断）
+/// BTR 诊断埋点日志工具（支持限流与 URL 脱敏截断，内置 2000 行环形缓冲）
 abstract final class BtrLog {
+  static const int maxCapacity = 2000;
+  static final ListQueue<String> _buffer = ListQueue<String>();
   static final Map<String, int> _lastLogTimeMs = {};
+
+  /// 环形缓冲当前行数
+  static int get length => _buffer.length;
+
+  /// 日志快照：返回最近最多 2000 行日志的只读副本
+  static List<String> snapshot() => List<String>.from(_buffer);
+
+  /// 清空日志环形缓冲
+  static void clear() {
+    _buffer.clear();
+  }
+
+  static void _append(String safeMessage) {
+    if (safeMessage.contains('\n')) {
+      for (final line in safeMessage.split('\n')) {
+        _appendLine(line);
+      }
+    } else {
+      _appendLine(safeMessage);
+    }
+  }
+
+  static void _appendLine(String line) {
+    if (_buffer.length >= maxCapacity) {
+      _buffer.removeFirst();
+    }
+    _buffer.addLast(line);
+  }
 
   /// 异常脱敏：把异常文本里的 http(s) 直链压成 host，防止带签名的 query 进日志。
   /// 不能用 Uri.parse 兜底 —— 解析失败会退回原始串，等于没脱敏；这里只做纯文本截取，
@@ -504,24 +535,30 @@ abstract final class BtrLog {
     }
   }
 
-  /// 普通调试日志输出（受 kDebugMode 保护）
+  /// 普通调试日志输出（经过 redact 脱敏，进环形缓冲；kDebugMode 下同时输出到控制台）
   static void log(String message) {
-    if (!kDebugMode) return;
-    debugPrint(message);
+    final safe = redact(message);
+    _append(safe);
+    {
+      debugPrint(safe);
+    }
   }
 
-  /// 限流日志输出：在 kDebugMode 下同 key 每条日志最多 1 次/秒
+  /// 限流日志输出：同 key 每条日志最多 1 次/秒（经过 redact 脱敏，进环形缓冲；kDebugMode 下同时输出到控制台）
   static void rateLimitedLog(
     String key,
     String message, {
     int minIntervalMs = 1000,
   }) {
-    if (!kDebugMode) return;
     final now = DateTime.now().millisecondsSinceEpoch;
     final last = _lastLogTimeMs[key] ?? 0;
     if (now - last >= minIntervalMs) {
       _lastLogTimeMs[key] = now;
-      debugPrint(message);
+      final safe = redact(message);
+      _append(safe);
+      {
+        debugPrint(safe);
+      }
     }
   }
 }

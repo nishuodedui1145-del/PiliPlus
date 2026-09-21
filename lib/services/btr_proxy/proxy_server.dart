@@ -13,7 +13,7 @@ import 'package:PiliPlus/services/btr_proxy/range_core.dart';
 import 'package:PiliPlus/services/btr_proxy/sidx_parser.dart';
 import 'package:PiliPlus/utils/accounts.dart';
 import 'package:flutter/foundation.dart'
-    show kDebugMode, debugPrint, visibleForTesting;
+    show debugPrint, visibleForTesting;
 
 /// 全局在途 Socket 预算承载器（对齐官方 idm-downloader.js:402-407）
 ///
@@ -89,11 +89,9 @@ class BtrProxyServer {
   /// 期间若收到新的 ensureStarted() 或新的客户端请求，将立即取消定时器。若已有待执行停止，只刷新定时器。
   void scheduleStop({Duration delay = const Duration(seconds: 5)}) {
     _scheduledStopTimer?.cancel();
-    if (kDebugMode) {
-      debugPrint(
-        '[BTR] 代理生命周期: 事件=scheduleStop 端口=${_server?.port ?? 0} 在途=${_activeTokens.length}',
-      );
-    }
+    BtrLog.log(
+      '[BTR] 代理生命周期: 事件=scheduleStop 端口=${_server?.port ?? 0} 在途=${_activeTokens.length}',
+    );
     _scheduledStopTimer = Timer(delay, () {
       _scheduledStopTimer = null;
       stop(force: false);
@@ -105,12 +103,10 @@ class BtrProxyServer {
     if (_scheduledStopTimer != null) {
       _scheduledStopTimer?.cancel();
       _scheduledStopTimer = null;
-      if (kDebugMode) {
-        debugPrint('[BTR] 代理停止已被新视频取消（延迟停止已撤销）');
-        debugPrint(
-          '[BTR] 代理生命周期: 事件=cancelStop 端口=${_server?.port ?? 0} 在途=${_activeTokens.length}',
-        );
-      }
+      BtrLog.log('[BTR] 代理停止已被新视频取消（延迟停止已撤销）');
+      BtrLog.log(
+        '[BTR] 代理生命周期: 事件=cancelStop 端口=${_server?.port ?? 0} 在途=${_activeTokens.length}',
+      );
       return true;
     }
     return false;
@@ -144,18 +140,14 @@ class BtrProxyServer {
         server.listen(
           _handleRequest,
           onError: (err) {
-            if (kDebugMode) {
-              debugPrint('BtrProxyServer error: ${BtrLog.redact(err)}');
-            }
+            BtrLog.log('BtrProxyServer error: ${BtrLog.redact(err)}');
           },
         );
 
-        if (kDebugMode) {
-          debugPrint('BtrProxyServer started on 127.0.0.1:${server.port}');
-          debugPrint(
-            '[BTR] 代理生命周期: 事件=start 端口=${server.port} 在途=${_activeTokens.length}',
-          );
-        }
+        BtrLog.log('BtrProxyServer started on 127.0.0.1:${server.port}');
+        BtrLog.log(
+          '[BTR] 代理生命周期: 事件=start 端口=${server.port} 在途=${_activeTokens.length}',
+        );
 
         return server.port;
       } finally {
@@ -177,21 +169,17 @@ class BtrProxyServer {
 
     if (!force) {
       if (_activeTokens.isNotEmpty) {
-        if (kDebugMode) {
-          debugPrint(
-            '[BTR] 代理停止跳过: 仍有在途请求 (${_activeTokens.length} 个)',
-          );
-        }
+        BtrLog.log(
+          '[BTR] 代理停止跳过: 仍有在途请求 (${_activeTokens.length} 个)',
+        );
         scheduleStop(delay: const Duration(seconds: 3));
         return;
       }
       final now = DateTime.now().millisecondsSinceEpoch;
       if (_lastRequestTimestamp > 0 && now - _lastRequestTimestamp < 3000) {
-        if (kDebugMode) {
-          debugPrint(
-            '[BTR] 代理停止跳过: 最近 ${(now - _lastRequestTimestamp)}ms 内有活跃请求',
-          );
-        }
+        BtrLog.log(
+          '[BTR] 代理停止跳过: 最近 ${(now - _lastRequestTimestamp)}ms 内有活跃请求',
+        );
         scheduleStop(delay: const Duration(seconds: 3));
         return;
       }
@@ -225,21 +213,17 @@ class BtrProxyServer {
         try {
           await server.close(force: true);
         } catch (e) {
-          if (kDebugMode) {
-            debugPrint('BtrProxyServer close error: ${BtrLog.redact(e)}');
-          }
+          BtrLog.log('BtrProxyServer close error: ${BtrLog.redact(e)}');
         }
       } finally {
         resetForNewVideo();
         _stopping = null;
-        if (kDebugMode) {
-          debugPrint(
-            '[BTR] 代理停止: 端口=$port 在途响应=$inFlight 强制=${forced ? '是' : '否'}',
-          );
-          debugPrint(
-            '[BTR] 代理生命周期: 事件=stop 端口=$port 在途=$inFlight',
-          );
-        }
+        BtrLog.log(
+          '[BTR] 代理停止: 端口=$port 在途响应=$inFlight 强制=${forced ? '是' : '否'}',
+        );
+        BtrLog.log(
+          '[BTR] 代理生命周期: 事件=stop 端口=$port 在途=$inFlight',
+        );
       }
     }();
 
@@ -249,11 +233,9 @@ class BtrProxyServer {
 
   /// 切视频或退出时重置所有活跃请求与缓存，释放复用的 HttpClient 连接池
   void resetForNewVideo() {
-    if (kDebugMode) {
-      debugPrint(
-        '[BTR] 代理生命周期: 事件=reset 端口=${_server?.port ?? 0} 在途=${_activeTokens.length}',
-      );
-    }
+    BtrLog.log(
+      '[BTR] 代理生命周期: 事件=reset 端口=${_server?.port ?? 0} 在途=${_activeTokens.length}',
+    );
     for (final token in List.of(_activeTokens)) {
       token.cancel('Video reset / page closed');
     }
@@ -340,11 +322,9 @@ class BtrProxyServer {
     _lastRequestTimestamp = DateTime.now().millisecondsSinceEpoch;
 
     if (_stopping != null) {
-      if (kDebugMode) {
-        debugPrint(
-          '[BTR] 警告: 在代理停止中收到客户端请求，拒绝处理: path=${request.uri.path}',
-        );
-      }
+      BtrLog.log(
+        '[BTR] 警告: 在代理停止中收到客户端请求，拒绝处理: path=${request.uri.path}',
+      );
       request.response.statusCode = HttpStatus.serviceUnavailable;
       await request.response.close();
       return;
@@ -449,18 +429,14 @@ class BtrProxyServer {
           final ageSec =
               (DateTime.now().millisecondsSinceEpoch - cached.measuredAtMs) ~/
                   1000;
-          if (kDebugMode) {
-            debugPrint(
-              '[BTR] CDN 竞速: 复用缓存（测于 $ageSec 秒前）最优=${cached.host}',
-            );
-          }
+          BtrLog.log(
+            '[BTR] CDN 竞速: 复用缓存（测于 $ageSec 秒前）最优=${cached.host}',
+          );
           pool.applyRacerHint(cached.host, cached.bytesPerSec);
-          if (kDebugMode) {
-            debugPrint(
-              '[BTR] CDN 竞速: 最优已应用于候选池 host=${cached.host} '
-              '估计=${(cached.bytesPerSec / 1048576).toStringAsFixed(2)} MB/s',
-            );
-          }
+          BtrLog.log(
+            '[BTR] CDN 竞速: 最优已应用于候选池 host=${cached.host} '
+            '估计=${(cached.bytesPerSec / 1048576).toStringAsFixed(2)} MB/s',
+          );
         } else {
           // 缓存过期或首次竞速：后台跑竞速（绝不阻塞当前播放）
           _triggerBackgroundRace(
@@ -556,12 +532,10 @@ class BtrProxyServer {
       // 任务 B：粘性单连接偏好命中（该视频多连接已判亏，直接单连接启动）
       // ⚠️ P1-5: 若本次请求正在尝试重接管，跳过粘性单连接拦截，允许真正走进多连接并发路径
       if (!isRetakeoverAttempt && pool.hasStickySingleConnection && request.method == 'GET') {
-        if (kDebugMode) {
-          debugPrint(
-            '[BTR] 粘性单连接命中（该视频多连接已判亏，直接单连接启动）: '
-            'host=${BtrLog.hostOf(targetUrl)}',
-          );
-        }
+        BtrLog.log(
+          '[BTR] 粘性单连接命中（该视频多连接已判亏，直接单连接启动）: '
+          'host=${BtrLog.hostOf(targetUrl)}',
+        );
         await _passthrough(
           clientRequest: request,
           targetUrl: targetUrl,
@@ -578,12 +552,10 @@ class BtrProxyServer {
       // B & C: 统一 close 责任，_passthrough 内不 close，由外层 finally 统一关闭
       if (_rangeUnsupportedUrls.contains(targetUrl)) {
         pool.singleConnectionSwitchCount++;
-        if (kDebugMode) {
-          debugPrint(
-            '[BTR] 上游已确认不支持 Range，直接单连接顺序透传: ${BtrLog.hostOf(targetUrl)}'
-            '（本视频第 ${pool.singleConnectionSwitchCount} 次切单连接）',
-          );
-        }
+        BtrLog.log(
+          '[BTR] 上游已确认不支持 Range，直接单连接顺序透传: ${BtrLog.hostOf(targetUrl)}'
+          '（本视频第 ${pool.singleConnectionSwitchCount} 次切单连接）',
+        );
         await _passthrough(
           clientRequest: request,
           targetUrl: targetUrl,
@@ -761,13 +733,11 @@ class BtrProxyServer {
           }
           await request.response.flush();
           bytesSent = true;
-          if (kDebugMode) {
-            debugPrint(
-              '[BTR] 首响应超时（>${RangeCore.firstResponseDeadline.inMilliseconds}ms）'
-              '→ 用 ${primerBytes.length} 字节顶出响应头（206 精确区间 '
-              'bytes=$start-$end/$resolvedTotal）: 节点=${BtrLog.hostOf(targetUrl)}',
-            );
-          }
+          BtrLog.log(
+            '[BTR] 首响应超时（>${RangeCore.firstResponseDeadline.inMilliseconds}ms）'
+            '→ 用 ${primerBytes.length} 字节顶出响应头（206 精确区间 '
+            'bytes=$start-$end/$resolvedTotal）: 节点=${BtrLog.hostOf(targetUrl)}',
+          );
           await _streamDirect(
             clientRequest: request,
             targetUrl: targetUrl,
@@ -794,17 +764,15 @@ class BtrProxyServer {
         }
         await request.response.flush();
         bytesSent = true;
-        if (kDebugMode) {
-          debugPrint(
-            '[BTR] 首响应超时（>${RangeCore.firstResponseDeadline.inMilliseconds}ms）'
-            '→ 用 ${primerBytes.length} 字节顶出响应头（总长度未知，退化为 200）: '
-            '节点=${BtrLog.hostOf(targetUrl)}',
-          );
-          debugPrint(
-            '[BTR] 顶头续流: start=$start 已写=${primerBytes.length} 续流起点=$nextOffset '
-            '来源=${BtrLog.hostOf(targetUrl)}',
-          );
-        }
+        BtrLog.log(
+          '[BTR] 首响应超时（>${RangeCore.firstResponseDeadline.inMilliseconds}ms）'
+          '→ 用 ${primerBytes.length} 字节顶出响应头（总长度未知，退化为 200）: '
+          '节点=${BtrLog.hostOf(targetUrl)}',
+        );
+        BtrLog.log(
+          '[BTR] 顶头续流: start=$start 已写=${primerBytes.length} 续流起点=$nextOffset '
+          '来源=${BtrLog.hostOf(targetUrl)}',
+        );
         await _streamDirect(
           clientRequest: request,
           targetUrl: targetUrl,
@@ -846,19 +814,15 @@ class BtrProxyServer {
       final int adaptiveConcurrency;
       if (pool.isSingleConnectionMode) {
         adaptiveConcurrency = 1;
-        if (kDebugMode) {
-          debugPrint(
-            '[BTR] 复用单连接模式: 节点=${BtrLog.hostOf(probe.winningUrl)} (并发无收益)',
-          );
-        }
+        BtrLog.log(
+          '[BTR] 复用单连接模式: 节点=${BtrLog.hostOf(probe.winningUrl)} (并发无收益)',
+        );
       } else if (pool.adaptiveConcurrency != null) {
         adaptiveConcurrency = pool.adaptiveConcurrency!;
-        if (kDebugMode) {
-          debugPrint(
-            '[BTR] 自适应并发复用: 节点=${BtrLog.hostOf(probe.winningUrl)}, '
-            '已选并发=$adaptiveConcurrency (配置上限=$allocatedThreads)',
-          );
-        }
+        BtrLog.log(
+          '[BTR] 自适应并发复用: 节点=${BtrLog.hostOf(probe.winningUrl)}, '
+          '已选并发=$adaptiveConcurrency (配置上限=$allocatedThreads)',
+        );
       } else {
         // 起播阶段：通过 startupConcurrencyTiers 决定起播并发起手值（对齐官方 native-mse-player.js:365-369）
         final requiredBps = RangeCore.requiredThroughputBytesPerSec(
@@ -982,7 +946,7 @@ class BtrProxyServer {
       if (bytesSent) {
         requestError = e;
         token.cancel(e);
-        if (kDebugMode) {
+        {
           debugPrint(
             '[BTR] 响应已发送部分数据后检测到不支持 Range (${BtrLog.redact(e)})，中止连接',
           );
@@ -995,12 +959,10 @@ class BtrProxyServer {
         pool.markDirectFallback('上游不支持或忽略Range');
         _rangeUnsupportedUrls.add(targetUrl);
         pool.singleConnectionSwitchCount++;
-        if (kDebugMode) {
-          debugPrint(
-            '[BTR] 上游不支持或忽略 Range (${BtrLog.redact(e)})，降级为单连接顺序透传: ${BtrLog.hostOf(targetUrl)}'
-            '（本视频第 ${pool.singleConnectionSwitchCount} 次切单连接）',
-          );
-        }
+        BtrLog.log(
+          '[BTR] 上游不支持或忽略 Range (${BtrLog.redact(e)})，降级为单连接顺序透传: ${BtrLog.hostOf(targetUrl)}'
+          '（本视频第 ${pool.singleConnectionSwitchCount} 次切单连接）',
+        );
         try {
           await _passthrough(
             clientRequest: request,
@@ -1025,9 +987,7 @@ class BtrProxyServer {
     } catch (e) {
       requestError = e;
       token.cancel(e);
-      if (kDebugMode) {
-        debugPrint('BtrProxyServer request error: ${BtrLog.redact(e)}');
-      }
+      BtrLog.log('BtrProxyServer request error: ${BtrLog.redact(e)}');
       if (!bytesSent) {
         final statusCode = _extractStatusCode(e);
         try {
@@ -1041,9 +1001,7 @@ class BtrProxyServer {
       // 统一唯一 close 责任处，彻底消除 double-close
       _activeTokens.remove(token);
       if (requestError != null && bytesSent) {
-        if (kDebugMode) {
-          debugPrint('[BTR] 传输过程中出错，中止连接: ${BtrLog.redact(requestError)}');
-        }
+        BtrLog.log('[BTR] 传输过程中出错，中止连接: ${BtrLog.redact(requestError)}');
         try {
           final socket = await request.response.detachSocket(writeHeaders: false);
           socket.destroy();
@@ -1083,27 +1041,21 @@ class BtrProxyServer {
       try {
         final result = await future;
         if (currentGen != _raceGeneration) {
-          if (kDebugMode) {
-            debugPrint(
-              '[BTR] CDN 竞速: 跨视频代际不一致 (gen=$currentGen, current=$_raceGeneration)，丢弃结果',
-            );
-          }
+          BtrLog.log(
+            '[BTR] CDN 竞速: 跨视频代际不一致 (gen=$currentGen, current=$_raceGeneration)，丢弃结果',
+          );
           racer.reset();
           return;
         }
         if (result != null) {
           pool.applyRacerHint(result.host, result.bytesPerSec);
-          if (kDebugMode) {
-            debugPrint(
-              '[BTR] CDN 竞速: 最优已应用于候选池 host=${result.host} '
-              '估计=${(result.bytesPerSec / 1048576).toStringAsFixed(2)} MB/s',
-            );
-          }
+          BtrLog.log(
+            '[BTR] CDN 竞速: 最优已应用于候选池 host=${result.host} '
+            '估计=${(result.bytesPerSec / 1048576).toStringAsFixed(2)} MB/s',
+          );
         }
       } catch (e) {
-        if (kDebugMode) {
-          debugPrint('[BTR] CDN 竞速后台异常: ${BtrLog.redact(e)}');
-        }
+        BtrLog.log('[BTR] CDN 竞速后台异常: ${BtrLog.redact(e)}');
       } finally {
         if (currentGen == _raceGeneration) {
           _inFlightRace = null;
@@ -1251,19 +1203,15 @@ class BtrProxyServer {
         for (final pool in _cdnPoolCache.values) {
           pool.applyRacerHint(res.host, res.bytesPerSec);
         }
-        if (kDebugMode) {
-          debugPrint(
-            '[BTR] CDN 竞速: 最优已应用于候选池 host=${res.host} '
-            '估计=${(res.bytesPerSec / 1048576).toStringAsFixed(2)} MB/s',
-          );
-        }
+        BtrLog.log(
+          '[BTR] CDN 竞速: 最优已应用于候选池 host=${res.host} '
+          '估计=${(res.bytesPerSec / 1048576).toStringAsFixed(2)} MB/s',
+        );
         return CdnRaceReraceResult.ok(res);
       }
       return const CdnRaceReraceResult.noWinner();
     } catch (e) {
-      if (kDebugMode) {
-        debugPrint('[BTR] 手动重新竞速失败: ${BtrLog.redact(e)}');
-      }
+      BtrLog.log('[BTR] 手动重新竞速失败: ${BtrLog.redact(e)}');
       return const CdnRaceReraceResult.failed();
     }
   }
