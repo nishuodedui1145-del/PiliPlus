@@ -10,7 +10,8 @@ import 'cdn_racer.dart';
 import 'multi_range_downloader.dart';
 import 'range_core.dart';
 import 'sidx_parser.dart';
-import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
+import 'package:flutter/foundation.dart'
+    show kDebugMode, debugPrint, visibleForTesting;
 
 /// 全局在途 Socket 预算承载器（对齐官方 idm-downloader.js:402-407）
 ///
@@ -774,6 +775,7 @@ class BtrProxyServer {
             endOffset: end,
             onByteSent: () => bytesSent = true,
             downloader: downloader,
+            pool: pool,
           );
           return; // 外层 finally 统一关闭
         }
@@ -809,6 +811,7 @@ class BtrProxyServer {
           fromOffset: nextOffset,
           onByteSent: () => bytesSent = true,
           downloader: downloader,
+          pool: pool,
         );
         return; // 外层 finally 统一关闭
       }
@@ -1289,6 +1292,8 @@ class BtrProxyServer {
     void Function()? onByteSent,
     CdnPool? pool,
     MultiRangeDownloader? downloader,
+    Duration firstByteTimeout = RangeCore.firstByteTimeout,
+    Duration stallTimeout = RangeCore.stallTimeout,
   }) async {
     token.throwIfCancelled();
     final release = downloader != null
@@ -1297,18 +1302,19 @@ class BtrProxyServer {
     final uri = Uri.parse(targetUrl);
     final client = _getOrCreateHttpClient();
 
-    HttpClientRequest? upstreamReq;
+    HttpClientRequest? currentReq;
     void onCancel() {
       try {
-        upstreamReq?.abort();
+        currentReq?.abort();
       } catch (_) {}
     }
     token.addListener(onCancel);
 
     try {
-      upstreamReq = await client.openUrl(clientRequest.method, uri);
+      final upstreamReq = await client.openUrl(clientRequest.method, uri);
+      currentReq = upstreamReq;
       defaultHeaders.forEach((k, v) {
-        upstreamReq!.headers.set(k, v);
+        upstreamReq.headers.set(k, v);
       });
 
       final clientRange = clientRequest.headers.value(HttpHeaders.rangeHeader);
@@ -1316,7 +1322,17 @@ class BtrProxyServer {
         upstreamReq.headers.set(HttpHeaders.rangeHeader, clientRange);
       }
 
-      final upstreamResp = await upstreamReq.close();
+      final HttpClientResponse upstreamResp;
+      try {
+        upstreamResp = await upstreamReq.close().timeout(firstByteTimeout);
+      } on TimeoutException {
+        try {
+          upstreamReq.abort();
+        } catch (_) {}
+        BtrLog.log('[BTR] 直连首字节超时（>15000ms）→ 放弃本次直连');
+        rethrow;
+      }
+
       clientRequest.response.statusCode = upstreamResp.statusCode;
 
       for (final headerName in [
@@ -1338,56 +1354,36 @@ class BtrProxyServer {
         return;
       }
 
-      int intervalBytes = 0;
-      final speedSw = Stopwatch()..start();
-      final targetBps = RangeCore.requiredThroughputBytesPerSec(
-        pool?.videoBitrateBytesPerSec,
+      final parsedRange = RangeCore.parseRangeHeader(clientRange);
+      final baseOffset = parsedRange?.start ?? 0;
+      final endOffset = parsedRange?.end;
+
+      int? maxBytes;
+      final clStr = upstreamResp.headers.value(HttpHeaders.contentLengthHeader);
+      final cl = clStr != null ? int.tryParse(clStr) : null;
+      if (cl != null && cl >= 0) {
+        maxBytes = cl;
+      } else if (endOffset != null && endOffset >= baseOffset) {
+        maxBytes = endOffset - baseOffset + 1;
+      }
+
+      await _streamBodyWithStallWatchdog(
+        clientRequest: clientRequest,
+        uri: uri,
+        client: client,
+        defaultHeaders: defaultHeaders,
+        token: token,
+        initialReq: upstreamReq,
+        initialResp: upstreamResp,
+        baseOffset: baseOffset,
+        endOffset: endOffset,
+        maxBytes: maxBytes,
+        onByteSent: onByteSent,
+        pool: pool,
+        onRequestChanged: (req) => currentReq = req,
+        stallTimeout: stallTimeout,
+        firstByteTimeout: firstByteTimeout,
       );
-      if (pool != null) {
-        final bitrateKnown = pool.videoBitrateBytesPerSec != null &&
-            pool.videoBitrateBytesPerSec! > 0;
-        final targetMbps = (targetBps / (1024 * 1024)).toStringAsFixed(2);
-        BtrLog.rateLimitedLog(
-          'mode_criteria',
-          '[BTR] 模式判据: 码率已知=$bitrateKnown target=$targetMbps MB/s',
-        );
-      }
-
-      await for (final chunk in upstreamResp) {
-        token.throwIfCancelled();
-        clientRequest.response.add(chunk);
-        await clientRequest.response.flush();
-        onByteSent?.call();
-        intervalBytes += chunk.length;
-
-        if (intervalBytes >= 1024 * 1024 ||
-            speedSw.elapsedMilliseconds >= 2000) {
-          final sec = max(0.001, speedSw.elapsedMicroseconds / 1000000.0);
-          final currentBps = intervalBytes / sec;
-          speedSw.reset();
-          intervalBytes = 0;
-          if (pool != null) {
-            pool.lastSingleConnectionSpeedBps = currentBps;
-            final unhooked = pool.recordSingleConnectionIntervalThroughput(
-              currentBps,
-              targetBps,
-            );
-            if (unhooked) {
-              final curMbps = (currentBps / (1024 * 1024)).toStringAsFixed(2);
-              final reqMbps =
-                  ((targetBps * RangeCore.switchBackMargin) / (1024 * 1024))
-                      .toStringAsFixed(2);
-              final multiAtSwitchMbps =
-                  (pool.lastMultiBpsAtSwitch / (1024 * 1024))
-                      .toStringAsFixed(2);
-              BtrLog.rateLimitedLog(
-                'proxy_single_slow_switch_back',
-                '[BTR] 粘性单连接解除（单连接=$curMbps MB/s < 目标×0.8=$reqMbps MB/s 且 切入时多连接=$multiAtSwitchMbps MB/s > 1.1×Z=true，本视频第 ${pool.stickyReleaseCount} 次）',
-              );
-            }
-          }
-        }
-      }
     } catch (e) {
       token.cancel(e);
       rethrow;
@@ -1454,6 +1450,9 @@ class BtrProxyServer {
     int? endOffset,
     void Function()? onByteSent,
     MultiRangeDownloader? downloader,
+    CdnPool? pool,
+    Duration firstByteTimeout = RangeCore.firstByteTimeout,
+    Duration stallTimeout = RangeCore.stallTimeout,
   }) async {
     token.throwIfCancelled();
     final release = downloader != null
@@ -1462,26 +1461,30 @@ class BtrProxyServer {
     final uri = Uri.parse(targetUrl);
     final client = _getOrCreateHttpClient();
 
-    HttpClientRequest? upstreamReq;
+    HttpClientRequest? currentReq;
     void onCancel() {
       try {
-        upstreamReq?.abort();
+        currentReq?.abort();
       } catch (_) {}
     }
     token.addListener(onCancel);
 
+    final clientRange = clientRequest.headers.value(HttpHeaders.rangeHeader);
+    final parsedRange = RangeCore.parseRangeHeader(clientRange);
+    final effectiveBase = fromOffset ?? (parsedRange?.start ?? 0);
+    final effectiveEnd = endOffset ?? parsedRange?.end;
+
     // 已经给客户端声明了 Content-Length 时，**绝不能多写一个字节**
     // （上游有时不严格按 Range 裁剪，会多给数据 → 写成超出长度会破坏响应）
-    final maxBytes = (endOffset != null && fromOffset != null)
-        ? (endOffset - fromOffset + 1)
-        : null;
-    var written = 0;
-    var earlyExit = false;
+    final maxBytes = (effectiveEnd != null && fromOffset != null)
+        ? (effectiveEnd - fromOffset + 1)
+        : (effectiveEnd != null ? (effectiveEnd - effectiveBase + 1) : null);
 
     try {
-      upstreamReq = await client.openUrl(clientRequest.method, uri);
+      final upstreamReq = await client.openUrl(clientRequest.method, uri);
+      currentReq = upstreamReq;
       defaultHeaders.forEach((k, v) {
-        upstreamReq!.headers.set(k, v);
+        upstreamReq.headers.set(k, v);
       });
       if (fromOffset != null) {
         // P2-12: endOffset != null 时使用闭合 Range，避免上游连接无休止拉取
@@ -1490,49 +1493,374 @@ class BtrProxyServer {
             : 'bytes=$fromOffset-';
         upstreamReq.headers.set(HttpHeaders.rangeHeader, rangeHeaderValue);
       } else {
-        final clientRange = clientRequest.headers.value(HttpHeaders.rangeHeader);
         if (clientRange != null) {
           upstreamReq.headers.set(HttpHeaders.rangeHeader, clientRange);
         }
       }
-      final upstreamResp = await upstreamReq.close();
+
+      final HttpClientResponse upstreamResp;
+      try {
+        upstreamResp = await upstreamReq.close().timeout(firstByteTimeout);
+      } on TimeoutException {
+        try {
+          upstreamReq.abort();
+        } catch (_) {}
+        BtrLog.log('[BTR] 直连首字节超时（>15000ms）→ 放弃本次直连');
+        rethrow;
+      }
+
       if (upstreamResp.statusCode >= 400) {
         throw UpstreamHttpException(
           upstreamResp.statusCode,
           '已发送响应头后上游仍返回错误',
+          uri: uri,
         );
       }
-      await for (final chunk in upstreamResp) {
+
+      await _streamBodyWithStallWatchdog(
+        clientRequest: clientRequest,
+        uri: uri,
+        client: client,
+        defaultHeaders: defaultHeaders,
+        token: token,
+        initialReq: upstreamReq,
+        initialResp: upstreamResp,
+        baseOffset: effectiveBase,
+        endOffset: effectiveEnd,
+        maxBytes: maxBytes,
+        onByteSent: onByteSent,
+        pool: pool,
+        onRequestChanged: (req) => currentReq = req,
+        stallTimeout: stallTimeout,
+        firstByteTimeout: firstByteTimeout,
+      );
+    } finally {
+      token.removeListener(onCancel);
+      release?.call();
+    }
+  }
+
+  /// 统一的带停滞看门狗与原地续拉的数据流传输核心逻辑
+  Future<void> _streamBodyWithStallWatchdog({
+    required HttpRequest clientRequest,
+    required Uri uri,
+    required HttpClient client,
+    required Map<String, String> defaultHeaders,
+    required CancellationToken token,
+    required HttpClientRequest initialReq,
+    required HttpClientResponse initialResp,
+    required int baseOffset,
+    required int? endOffset,
+    required int? maxBytes,
+    void Function()? onByteSent,
+    CdnPool? pool,
+    void Function(HttpClientRequest? req)? onRequestChanged,
+    Duration stallTimeout = RangeCore.stallTimeout,
+    Duration firstByteTimeout = RangeCore.firstByteTimeout,
+  }) async {
+    HttpClientRequest? currentReq = initialReq;
+    HttpClientResponse currentResp = initialResp;
+    var written = 0;
+    var earlyExit = false;
+    var stallRetries = 0;
+    const maxStallRetries = 3;
+
+    int intervalBytes = 0;
+    final speedSw = Stopwatch()..start();
+    final targetBps = RangeCore.requiredThroughputBytesPerSec(
+      pool?.videoBitrateBytesPerSec,
+    );
+    if (pool != null) {
+      final bitrateKnown = pool.videoBitrateBytesPerSec != null &&
+          pool.videoBitrateBytesPerSec! > 0;
+      final targetMbps = (targetBps / (1024 * 1024)).toStringAsFixed(2);
+      BtrLog.rateLimitedLog(
+        'mode_criteria',
+        '[BTR] 模式判据: 码率已知=$bitrateKnown target=$targetMbps MB/s',
+      );
+    }
+
+    final stallWatch = Stopwatch();
+
+    try {
+      while (!earlyExit) {
         token.throwIfCancelled();
-        var data = chunk;
-        if (maxBytes != null) {
-          final remaining = maxBytes - written;
-          if (remaining <= 0) {
-            earlyExit = true;
+
+        bool isStalled = false;
+        bool isDone = false;
+        bool cancelledByUs = false;
+        StreamSubscription<List<int>>? sub;
+        final roundCompleter = Completer<void>();
+        Timer? stallTimer;
+
+        void resetStallTimer() {
+          stallTimer?.cancel();
+          stallWatch
+            ..reset()
+            ..start();
+          stallTimer = Timer(stallTimeout, () async {
+            isStalled = true;
+            cancelledByUs = true;
+            try {
+              await sub?.cancel();
+            } catch (_) {}
+            try {
+              currentReq?.abort();
+            } catch (_) {}
+            if (!roundCompleter.isCompleted) {
+              roundCompleter.complete();
+            }
+          });
+        }
+
+        sub = currentResp.listen(
+          (chunk) async {
+            resetStallTimer();
+            if (token.isCancelled) {
+              cancelledByUs = true;
+              await sub?.cancel();
+              if (!roundCompleter.isCompleted) {
+                try {
+                  token.throwIfCancelled();
+                } catch (e, st) {
+                  roundCompleter.completeError(e, st);
+                }
+              }
+              return;
+            }
+
+            sub?.pause();
+            try {
+              var data = chunk;
+              if (maxBytes != null) {
+                final remaining = maxBytes - written;
+                if (remaining <= 0) {
+                  earlyExit = true;
+                  cancelledByUs = true;
+                  await sub?.cancel();
+                  if (!roundCompleter.isCompleted) {
+                    roundCompleter.complete();
+                  }
+                  return;
+                }
+                if (data.length > remaining) {
+                  data = data.sublist(0, remaining);
+                  earlyExit = true;
+                }
+              }
+
+              clientRequest.response.add(data);
+              written += data.length;
+              await clientRequest.response.flush();
+              onByteSent?.call();
+
+              intervalBytes += data.length;
+              if (intervalBytes >= 1024 * 1024 ||
+                  speedSw.elapsedMilliseconds >= 2000) {
+                final sec = max(0.001, speedSw.elapsedMicroseconds / 1000000.0);
+                final currentBps = intervalBytes / sec;
+                speedSw.reset();
+                intervalBytes = 0;
+                if (pool != null) {
+                  pool.lastSingleConnectionSpeedBps = currentBps;
+                  final unhooked = pool.recordSingleConnectionIntervalThroughput(
+                    currentBps,
+                    targetBps,
+                  );
+                  if (unhooked) {
+                    final curMbps = (currentBps / (1024 * 1024)).toStringAsFixed(2);
+                    final reqMbps =
+                        ((targetBps * RangeCore.switchBackMargin) / (1024 * 1024))
+                            .toStringAsFixed(2);
+                    final multiAtSwitchMbps =
+                        (pool.lastMultiBpsAtSwitch / (1024 * 1024))
+                            .toStringAsFixed(2);
+                    BtrLog.rateLimitedLog(
+                      'proxy_single_slow_switch_back',
+                      '[BTR] 粘性单连接解除（单连接=$curMbps MB/s < 目标×0.8=$reqMbps MB/s 且 切入时多连接=$multiAtSwitchMbps MB/s > 1.1×Z=true，本视频第 ${pool.stickyReleaseCount} 次）',
+                    );
+                  }
+                }
+              }
+
+              if (earlyExit) {
+                cancelledByUs = true;
+                await sub?.cancel();
+                if (!roundCompleter.isCompleted) {
+                  roundCompleter.complete();
+                }
+              }
+            } catch (e, st) {
+              cancelledByUs = true;
+              try {
+                await sub?.cancel();
+              } catch (_) {}
+              if (!roundCompleter.isCompleted) {
+                roundCompleter.completeError(e, st);
+              }
+            } finally {
+              if (!cancelledByUs && !isDone && !earlyExit) {
+                try {
+                  sub?.resume();
+                } catch (_) {}
+              }
+            }
+          },
+          onError: (Object e, StackTrace st) {
+            if (cancelledByUs || isStalled) {
+              return;
+            }
+            if (!roundCompleter.isCompleted) {
+              roundCompleter.completeError(e, st);
+            }
+          },
+          onDone: () {
+            isDone = true;
+            if (!roundCompleter.isCompleted) {
+              roundCompleter.complete();
+            }
+          },
+          cancelOnError: true,
+        );
+
+        resetStallTimer();
+
+        try {
+          await roundCompleter.future;
+        } finally {
+          stallTimer?.cancel();
+          try {
+            await sub.cancel();
+          } catch (_) {}
+        }
+
+        if (earlyExit) {
+          break;
+        }
+
+        if (isStalled) {
+          stallRetries++;
+          final stallMs = max(stallTimeout.inMilliseconds, stallWatch.elapsedMilliseconds);
+          final resumeOffset = baseOffset + written;
+
+          if (stallRetries > maxStallRetries) {
+            BtrLog.log('[BTR] 直连停滞放弃: 连续 3 次无数据，已断开本次响应');
+            try {
+              await clientRequest.response.close();
+            } catch (_) {}
             break;
           }
-          if (data.length > remaining) {
-            data = data.sublist(0, remaining);
-            earlyExit = true;
+
+          BtrLog.log(
+            '[BTR] 直连停滞 ${stallMs}ms 无数据 → 从 offset=$resumeOffset 续拉（第 $stallRetries/$maxStallRetries 次）',
+          );
+
+          await Future.delayed(const Duration(milliseconds: 500));
+          token.throwIfCancelled();
+
+          try {
+            currentReq?.abort();
+          } catch (_) {}
+          currentReq = null;
+          onRequestChanged?.call(null);
+
+          final newReq = await client.openUrl(clientRequest.method, uri);
+          currentReq = newReq;
+          onRequestChanged?.call(newReq);
+
+          defaultHeaders.forEach((k, v) {
+            newReq.headers.set(k, v);
+          });
+
+          final String resumeRange = endOffset != null
+              ? 'bytes=$resumeOffset-$endOffset'
+              : 'bytes=$resumeOffset-';
+          newReq.headers.set(HttpHeaders.rangeHeader, resumeRange);
+
+          final HttpClientResponse newResp;
+          try {
+            newResp = await newReq.close().timeout(firstByteTimeout);
+          } on TimeoutException {
+            try {
+              newReq.abort();
+            } catch (_) {}
+            BtrLog.log('[BTR] 直连首字节超时（>15000ms）→ 放弃本次直连');
+            rethrow;
           }
-        }
-        clientRequest.response.add(data);
-        await clientRequest.response.flush();
-        written += data.length;
-        onByteSent?.call();
-        if (earlyExit) {
+
+          if (newResp.statusCode >= 400) {
+            throw UpstreamHttpException(
+              newResp.statusCode,
+              '已发送响应头后上游仍返回错误',
+              uri: uri,
+            );
+          }
+
+          if (resumeOffset > 0 && newResp.statusCode == HttpStatus.ok) {
+            throw const RangeNotSupportedException('直连续拉上游忽略 Range 返回 200');
+          }
+
+          currentResp = newResp;
+        } else {
           break;
         }
       }
     } finally {
-      token.removeListener(onCancel);
-      if (earlyExit) {
-        // P2-12: 提前 break 时必须 abort 上游连接，防止后台继续漏水与占用连接池
+      if (earlyExit || stallRetries > maxStallRetries) {
         try {
-          upstreamReq?.abort();
+          currentReq?.abort();
         } catch (_) {}
       }
-      release?.call();
     }
   }
+
+  @visibleForTesting
+  Future<void> testPassthrough({
+    required HttpRequest clientRequest,
+    required String targetUrl,
+    required CancellationToken token,
+    required Map<String, String> defaultHeaders,
+    void Function()? onByteSent,
+    CdnPool? pool,
+    MultiRangeDownloader? downloader,
+    Duration firstByteTimeout = RangeCore.firstByteTimeout,
+    Duration stallTimeout = RangeCore.stallTimeout,
+  }) => _passthrough(
+    clientRequest: clientRequest,
+    targetUrl: targetUrl,
+    token: token,
+    defaultHeaders: defaultHeaders,
+    onByteSent: onByteSent,
+    pool: pool,
+    downloader: downloader,
+    firstByteTimeout: firstByteTimeout,
+    stallTimeout: stallTimeout,
+  );
+
+  @visibleForTesting
+  Future<void> testStreamDirect({
+    required HttpRequest clientRequest,
+    required String targetUrl,
+    required CancellationToken token,
+    required Map<String, String> defaultHeaders,
+    int? fromOffset,
+    int? endOffset,
+    void Function()? onByteSent,
+    MultiRangeDownloader? downloader,
+    CdnPool? pool,
+    Duration firstByteTimeout = RangeCore.firstByteTimeout,
+    Duration stallTimeout = RangeCore.stallTimeout,
+  }) => _streamDirect(
+    clientRequest: clientRequest,
+    targetUrl: targetUrl,
+    token: token,
+    defaultHeaders: defaultHeaders,
+    fromOffset: fromOffset,
+    endOffset: endOffset,
+    onByteSent: onByteSent,
+    downloader: downloader,
+    pool: pool,
+    firstByteTimeout: firstByteTimeout,
+    stallTimeout: stallTimeout,
+  );
 }
