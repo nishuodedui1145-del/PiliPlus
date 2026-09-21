@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
+import 'package:PiliPlus/services/btr_proxy/cdn_racer.dart';
 import 'package:PiliPlus/services/btr_proxy/proxy_server.dart';
 import 'package:PiliPlus/utils/storage.dart';
 import 'package:PiliPlus/utils/storage_key.dart';
@@ -226,15 +227,27 @@ class _BtrQuickSettingSheetState extends State<BtrQuickSettingSheet> {
                           : () async {
                               setState(() => _reRacing = true);
                               try {
-                                final res =
+                                final reraceRes =
                                     await BtrProxyServer.instance.rerace();
                                 if (mounted) {
-                                  if (res != null) {
-                                    SmartDialog.showToast(
-                                      '竞速完成: 最优=${res.host} (${(res.bytesPerSec / 1048576).toStringAsFixed(2)} MB/s)',
-                                    );
-                                  } else {
-                                    SmartDialog.showToast('当前无可用视频样本，无法重新竞速');
+                                  switch (reraceRes.outcome) {
+                                    case CdnRaceOutcome.ok:
+                                      final res = reraceRes.result!;
+                                      SmartDialog.showToast(
+                                        '竞速完成: 最优=${res.host} (${(res.bytesPerSec / 1048576).toStringAsFixed(2)} MB/s)',
+                                      );
+                                    case CdnRaceOutcome.noSample:
+                                      SmartDialog.showToast(
+                                        '还没有走代理的播放样本：请先重新进入视频（或切画质）让 BTR 生效后再试',
+                                      );
+                                    case CdnRaceOutcome.noWinner:
+                                      SmartDialog.showToast(
+                                        '竞速完成：候选节点全部超时/失败，未改变现役节点',
+                                      );
+                                    case CdnRaceOutcome.failed:
+                                      SmartDialog.showToast(
+                                        '竞速失败（网络/鉴权异常），详见日志',
+                                      );
                                   }
                                 }
                               } finally {

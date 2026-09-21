@@ -473,8 +473,22 @@ class CdnPool {
 
   bool get hasRacerHint => _racerHintHost != null && _racerHintHost!.isNotEmpty;
 
+  /// 竞速 hint / 粘性节点是否越过「当前服务分组」。
+  ///
+  /// 判定依据：用户手选分组优先（未探测完成也立即生效），其次才是起播测速定下的分组；
+  /// auto 模式且探测还没定组时不拦（`_activeGroup` 此时只是默认值，用它判定会把
+  /// auto 下竞速选出的海外节点误判成越界）。
+  bool _conflictsServedGroup(String url) {
+    final g = preferredGroup ?? (_groupDecided ? _activeGroup : null);
+    if (g == null) return false;
+    final host = CdnBanList.hostOf(url);
+    if (host.isEmpty) return false;
+    return g == CdnGroup.overseas
+        ? !overseasHosts.contains(host)
+        : overseasHosts.contains(host);
+  }
+
   void applyRacerHint(String host, double bytesPerSec) {
-    _racerHintHost = host;
     final lowerHost = host.toLowerCase();
 
     String? matchedUrl;
@@ -500,14 +514,29 @@ class CdnPool {
       } catch (_) {}
     }
 
-    if (matchedUrl != null) {
-      _racerHintUrl = matchedUrl;
+    if (matchedUrl == null) return;
+
+    // 越过分组时不写 hint / 粘性（只记录实测速度），否则 hint 会被
+    // _getMainPoolUrls() 无条件前置进主池，直接绕过分组过滤。
+    if (_conflictsServedGroup(matchedUrl)) {
       final h = _health.putIfAbsent(matchedUrl, CdnNodeHealth.new);
       if (h.bps < bytesPerSec) {
         h.bps = bytesPerSec;
       }
-      setStickyUrl(matchedUrl);
+      BtrLog.rateLimitedLog(
+        'racer_hint_group',
+        '[BTR] 竞速最优 ${BtrLog.hostOf(matchedUrl)} 不属于当前分组，仅记录速度不设为 hint',
+      );
+      return;
     }
+
+    _racerHintHost = host;
+    _racerHintUrl = matchedUrl;
+    final h = _health.putIfAbsent(matchedUrl, CdnNodeHealth.new);
+    if (h.bps < bytesPerSec) {
+      h.bps = bytesPerSec;
+    }
+    setStickyUrl(matchedUrl);
   }
 
   void clearRacerHint() {
@@ -809,7 +838,11 @@ class CdnPool {
     final base = _activeGroup == CdnGroup.mainland
         ? _mainlandCandidateUrls
         : _overseasCandidateUrls;
-    final hint = _racerHintUrl;
+    // hint 越过分组时不得前置进主池（否则等于绕过分组过滤）
+    final hint =
+        (_racerHintUrl != null && !_conflictsServedGroup(_racerHintUrl!))
+            ? _racerHintUrl
+            : null;
     final result = <String>[
       ..._anchorCandidateUrls,
       ?hint,
@@ -824,7 +857,10 @@ class CdnPool {
     final base = _activeGroup == CdnGroup.mainland
         ? _overseasCandidateUrls
         : _mainlandCandidateUrls;
-    final hint = _racerHintUrl;
+    final hint =
+        (_racerHintUrl != null && !_conflictsServedGroup(_racerHintUrl!))
+            ? _racerHintUrl
+            : null;
     final result = <String>[
       ..._anchorCandidateUrls,
       ?hint,
@@ -962,6 +998,7 @@ class CdnPool {
     if (hint != null &&
         pool.contains(hint) &&
         isUsable(hint) &&
+        !_conflictsServedGroup(hint) &&
         !(_health[hint]?.isBlocked(now) ?? false)) {
       final others = pool.where((u) => u != hint).toList()
         ..sort((a, b) => (_health[b]?.bps ?? 0.0).compareTo(_health[a]?.bps ?? 0.0));
@@ -997,9 +1034,11 @@ class CdnPool {
       return [anchor, ...others];
     }
 
-    // 节点粘性：若已锁定最快节点且仍有效，优先固定用它
+    // 节点粘性：若已锁定最快节点且仍有效，优先固定用它（粘性节点不得越过当前分组）
     if (_stickyUrl != null) {
-      if (isStickyValid(_stickyUrl)) {
+      if (pool.contains(_stickyUrl) &&
+          isStickyValid(_stickyUrl) &&
+          !_conflictsServedGroup(_stickyUrl!)) {
         final sticky = _stickyUrl!;
         final speed = _health[sticky]?.bps ?? 0.0;
         final others = pool.where((u) => u != sticky).toList();

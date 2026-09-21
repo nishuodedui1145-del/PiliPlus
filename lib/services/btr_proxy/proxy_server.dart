@@ -69,6 +69,7 @@ class BtrProxyServer {
   String? lastSampleUrl;
   String? lastGroup;
   Future<CdnRaceResult?>? _inFlightRace;
+  int _raceGeneration = 0;
 
   BtrProxyServer._();
 
@@ -271,6 +272,11 @@ class BtrProxyServer {
     _httpClient?.close(force: true);
     _httpClient = null;
     _lastRequestTimestamp = 0;
+    lastSampleUrl = null;
+    lastGroup = null;
+    racer.reset();
+    _raceGeneration++;
+    _inFlightRace = null;
   }
 
   /// 生成供播放器（如 mpv）请求的本地 URL-safe 代理地址
@@ -1061,6 +1067,7 @@ class BtrProxyServer {
         ? cdnCandidates
         : (group == 'overseas' ? CdnPool.overseasHosts : CdnPool.mainlandHosts);
 
+    final currentGen = _raceGeneration;
     final future = racer.raceThroughput(
       candidates: candidates,
       sampleUrl: sampleUrl,
@@ -1072,6 +1079,15 @@ class BtrProxyServer {
     unawaited(() async {
       try {
         final result = await future;
+        if (currentGen != _raceGeneration) {
+          if (kDebugMode) {
+            debugPrint(
+              '[BTR] CDN 竞速: 跨视频代际不一致 (gen=$currentGen, current=$_raceGeneration)，丢弃结果',
+            );
+          }
+          racer.reset();
+          return;
+        }
         if (result != null) {
           pool.applyRacerHint(result.host, result.bytesPerSec);
           if (kDebugMode) {
@@ -1086,7 +1102,9 @@ class BtrProxyServer {
           debugPrint('[BTR] CDN 竞速后台异常: ${BtrLog.redact(e)}');
         }
       } finally {
-        _inFlightRace = null;
+        if (currentGen == _raceGeneration) {
+          _inFlightRace = null;
+        }
       }
     }());
   }
@@ -1171,22 +1189,59 @@ class BtrProxyServer {
     }
   }
 
+  /// 校验样本 URL 是否新鲜。
+  ///
+  /// 只解析 `deadline`（秒级时间戳）拦「**已被证明过期**」的样本：
+  /// - 有 `deadline` 且已过期 → false（过期）
+  /// - 有 `deadline` 且未过期 → true
+  /// - **没有 `deadline` / 解析不出来 → true（不拦）**：B 站部分直链不带签名参数，
+  ///   不能因为「看不出过期」就误判成「无样本」把真实路径拦掉；真不新鲜时竞速会自然失败（noWinner）。
+  static bool _isSampleUrlFresh(String url) {
+    try {
+      final uri = Uri.parse(url);
+      final deadlineStr = uri.queryParameters['deadline'];
+      if (deadlineStr == null || deadlineStr.isEmpty) {
+        return true;
+      }
+      final deadlineSec = int.tryParse(deadlineStr);
+      if (deadlineSec == null) {
+        return true;
+      }
+      final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      return deadlineSec > nowSec;
+    } catch (_) {
+      return true;
+    }
+  }
+
   /// 立即手动重新竞速（快设面板「立即重新竞速」按钮调用）
-  Future<CdnRaceResult?> rerace() async {
+  Future<CdnRaceReraceResult> rerace() async {
     final sample = lastSampleUrl;
     if (sample == null || sample.isEmpty) {
-      return null;
+      return const CdnRaceReraceResult.noSample();
     }
+    if (!_isSampleUrlFresh(sample)) {
+      lastSampleUrl = null;
+      lastGroup = null;
+      return const CdnRaceReraceResult.noSample();
+    }
+
     final group = lastGroup ?? 'auto';
     final candidates = cdnCandidates.isNotEmpty
         ? cdnCandidates
         : (group == 'overseas' ? CdnPool.overseasHosts : CdnPool.mainlandHosts);
+
+    // 手动竞速合并传入所有活跃 pool 的 bannedHosts
+    final bannedHosts = _cdnPoolCache.values
+        .expand((p) => p.banList.bannedHosts)
+        .toSet();
 
     try {
       final res = await racer.raceThroughput(
         candidates: candidates,
         sampleUrl: sample,
         group: group,
+        bannedHosts: bannedHosts,
         ignoreHysteresis: true,
       );
       if (res != null) {
@@ -1199,13 +1254,14 @@ class BtrProxyServer {
             '估计=${(res.bytesPerSec / 1048576).toStringAsFixed(2)} MB/s',
           );
         }
+        return CdnRaceReraceResult.ok(res);
       }
-      return res;
+      return const CdnRaceReraceResult.noWinner();
     } catch (e) {
       if (kDebugMode) {
         debugPrint('[BTR] 手动重新竞速失败: ${BtrLog.redact(e)}');
       }
-      return null;
+      return const CdnRaceReraceResult.failed();
     }
   }
 

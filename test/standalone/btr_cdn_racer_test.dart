@@ -14,6 +14,7 @@ import 'dart:math';
 import 'package:flutter_test/flutter_test.dart';
 
 // ⚠️ 必须引镜像目录（btr/），不能相对路径引 lib/：同名类会被加载两份，`is` 判断静默失效
+import 'btr/cdn_pool.dart';
 import 'btr/cdn_racer.dart';
 
 Future<HttpServer> createFakeCdnServer({
@@ -297,5 +298,89 @@ void main() {
         await s.close(force: true);
       }
     }
+  });
+
+  test('7. auto 分组候选过滤：海外/大陆交替各取，Akamai 被跳过，两组均有代表', () {
+    final racer = CdnRacer(maxCandidates: 6);
+    final candidates = [
+      'upos-sz-mirrorali.bilivideo.com',
+      'upos-sz-mirroralib.bilivideo.com',
+      'upos-sz-mirroralio1.bilivideo.com',
+      'upos-sz-mirrorcos.bilivideo.com',
+      'upos-sz-mirrorcosb.bilivideo.com',
+      'upos-sz-mirrorcoso1.bilivideo.com',
+      'upos-hz-mirrorakam.akamaized.net',
+      'upos-sz-mirroraliov.bilivideo.com',
+      'upos-sz-mirrorcosov.bilivideo.com',
+      'upos-sz-mirrorhwov.bilivideo.com',
+    ];
+
+    final filtered = racer.filterCandidates(
+      candidates: candidates,
+      group: 'auto',
+    );
+
+    // 1. 长度不超过 6
+    expect(filtered.length, equals(6));
+    // 2. Akamai 节点被跳过
+    expect(filtered.contains('upos-hz-mirrorakam.akamaized.net'), isFalse);
+    // 3. 海外与大陆交替各取：第 1 个为海外，第 2 个为大陆，依此类推
+    expect(CdnRacer.overseasHosts.contains(filtered[0]), isTrue);
+    expect(CdnRacer.overseasHosts.contains(filtered[1]), isFalse);
+    expect(CdnRacer.overseasHosts.contains(filtered[2]), isTrue);
+    expect(CdnRacer.overseasHosts.contains(filtered[3]), isFalse);
+    expect(CdnRacer.overseasHosts.contains(filtered[4]), isTrue);
+    expect(CdnRacer.overseasHosts.contains(filtered[5]), isFalse);
+  });
+
+  test('8. 假极速截断校验：未收满 probeBytes 的响应直接判为失败返回 null', () async {
+    const probeBytes = 65536;
+    // 假服务器只吐 8192 字节（远低于 65536 * 0.95）就断流
+    final truncatedServer = await createFakeCdnServer(
+      delayMsPerChunk: 0,
+      totalBytes: 8192,
+    );
+
+    try {
+      final racer = CdnRacer(
+        probeBytes: probeBytes,
+        probeBudgetMs: 800,
+        logger: (_) {},
+      );
+
+      final host = '127.0.0.1:${truncatedServer.port}';
+      final result = await racer.raceThroughput(
+        candidates: [host],
+        sampleUrl: 'http://$host/video.m4s',
+        group: 'auto',
+      );
+
+      // 未收满直接判为失败（返回 null），不得算作有效吞吐
+      expect(result, isNull);
+    } finally {
+      await truncatedServer.close(force: true);
+    }
+  });
+
+  test('9. 分组防穿透：粘性节点不在当前分组可用池时不被 rangeCandidates 采用', () {
+    final pool = CdnPool(
+      originalUrls: [
+        'https://upos-sz-mirrorcosov.bilivideo.com/video.m4s',
+      ],
+      preferredGroup: CdnGroup.overseas,
+    );
+
+    // 模拟竞速把大陆节点写入粘性
+    const mainlandHost = 'upos-sz-mirrorali.bilivideo.com';
+    pool.applyRacerHint(mainlandHost, 10 * 1024 * 1024);
+
+    final candidates = pool.rangeCandidates();
+    // 选出的候选池首位不得是越界的大陆节点
+    expect(candidates, isNotEmpty);
+    expect(
+      candidates.first.contains(mainlandHost),
+      isFalse,
+      reason: '粘性节点不得越过当前 overseas 分组',
+    );
   });
 }

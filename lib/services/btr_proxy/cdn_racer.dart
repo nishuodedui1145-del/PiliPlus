@@ -34,6 +34,44 @@ class CdnRaceResult {
       'CdnRaceResult(host: $host, speed: ${(bytesPerSec / (1024 * 1024)).toStringAsFixed(2)} MB/s, group: $group)';
 }
 
+/// 手动重新竞速结果状态
+enum CdnRaceOutcome {
+  ok,
+  noSample,
+  noWinner,
+  failed,
+}
+
+/// 手动重新竞速结果包装
+class CdnRaceReraceResult {
+  final CdnRaceOutcome outcome;
+  final CdnRaceResult? result;
+
+  const CdnRaceReraceResult({
+    required this.outcome,
+    this.result,
+  });
+
+  const CdnRaceReraceResult.ok(CdnRaceResult res)
+      : outcome = CdnRaceOutcome.ok,
+        result = res;
+
+  const CdnRaceReraceResult.noSample()
+      : outcome = CdnRaceOutcome.noSample,
+        result = null;
+
+  const CdnRaceReraceResult.noWinner()
+      : outcome = CdnRaceOutcome.noWinner,
+        result = null;
+
+  const CdnRaceReraceResult.failed()
+      : outcome = CdnRaceOutcome.failed,
+        result = null;
+
+  @override
+  String toString() => 'CdnRaceReraceResult(outcome: $outcome, result: $result)';
+}
+
 /// 纯 Dart 实现的 CDN 自动竞速器
 ///
 /// 约束：不得 import lib/models/...、lib/utils/...、Pref。
@@ -139,6 +177,14 @@ class CdnRacer {
   /// 缓存是否在 TTL 内有效
   bool get isFresh => cached != null;
 
+  /// 判断 host 是否为 Akamai 节点（替换 host 探测必然失败，白占探测位）
+  static bool isAkamaiHost(String host) {
+    final lower = host.contains(':')
+        ? host.split(':').first.toLowerCase()
+        : host.toLowerCase();
+    return lower == 'akamaized.net' || lower.endsWith('.akamaized.net');
+  }
+
   /// 裁剪候选节点：按 group 过滤、去拉黑、截取前 maxCandidates
   List<String> filterCandidates({
     required List<String> candidates,
@@ -157,13 +203,14 @@ class CdnRacer {
 
     List<String> groupFiltered;
     if (group == 'overseas') {
-      final overseasOnly = notBanned.where((c) {
+      final nonAkamai = notBanned.where((c) => !isAkamaiHost(c)).toList();
+      final overseasOnly = nonAkamai.where((c) {
         final host = c.contains(':')
             ? c.split(':').first.toLowerCase()
             : c.toLowerCase();
         return overseasHosts.contains(host);
       }).toList();
-      groupFiltered = overseasOnly.isNotEmpty ? overseasOnly : notBanned;
+      groupFiltered = overseasOnly.isNotEmpty ? overseasOnly : nonAkamai;
     } else if (group == 'mainland') {
       final mainlandOnly = notBanned.where((c) {
         final host = c.contains(':')
@@ -173,7 +220,40 @@ class CdnRacer {
       }).toList();
       groupFiltered = mainlandOnly.isNotEmpty ? mainlandOnly : notBanned;
     } else {
-      groupFiltered = notBanned;
+      // auto 分支：跳过 Akamai，保证两组都有代表，按「海外组 1 个、大陆组 1 个」交替各取
+      final nonAkamai = notBanned.where((c) => !isAkamaiHost(c)).toList();
+      final overseas = <String>[];
+      final mainland = <String>[];
+      for (final c in nonAkamai) {
+        final host = c.contains(':')
+            ? c.split(':').first.toLowerCase()
+            : c.toLowerCase();
+        if (overseasHosts.contains(host)) {
+          overseas.add(c);
+        } else {
+          mainland.add(c);
+        }
+      }
+
+      if (overseas.isEmpty || mainland.isEmpty) {
+        // 任一组为空时退化为原逻辑
+        groupFiltered = nonAkamai;
+      } else {
+        final combined = <String>[];
+        int oIdx = 0;
+        int mIdx = 0;
+        while (combined.length < maxCandidates &&
+            (oIdx < overseas.length || mIdx < mainland.length)) {
+          if (oIdx < overseas.length) {
+            combined.add(overseas[oIdx++]);
+            if (combined.length >= maxCandidates) break;
+          }
+          if (mIdx < mainland.length) {
+            combined.add(mainland[mIdx++]);
+          }
+        }
+        groupFiltered = combined;
+      }
     }
 
     return groupFiltered.take(maxCandidates).toList();
@@ -228,7 +308,11 @@ class CdnRacer {
       }
       sw.stop();
 
-      if (receivedBytes == 0) return null;
+      // 只有收满（或至少 >= probeBytes * 0.95）才算有效样本；未收满直接判为失败返回 null
+      final minValidBytes = (probeBytes * 0.95).floor();
+      if (receivedBytes < minValidBytes) {
+        return null;
+      }
 
       final elapsedUs = max(100, sw.elapsedMicroseconds);
       final sec = elapsedUs / 1000000.0;
