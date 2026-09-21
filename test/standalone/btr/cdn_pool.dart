@@ -1,6 +1,5 @@
 import 'dart:math';
 
-import 'package:flutter/foundation.dart' show debugPrint;
 
 import 'cdn_type.dart';
 
@@ -630,13 +629,13 @@ class CdnPool {
       final mbps = rate / 1000000.0;
       final targetMbps =
           RangeCore.requiredThroughputBytesPerSec(rate) / 1000000.0;
-      debugPrint(
+      BtrLog.log(
         '[BTR] 码率解析: ${hostPrefix}bw=$bw bps → ${mbps.toStringAsFixed(2)} MB/s'
         '（单连接够用门限 ${targetMbps.toStringAsFixed(2)} MB/s）',
       );
     } else {
       const fallbackMbps = RangeCore.singleAdequateFallbackBps / 1000000.0;
-      debugPrint(
+      BtrLog.log(
         '[BTR] 码率解析: $hostPrefix未获取到码率(bw缺失) → '
         '兜底单连接够用门限 ${fallbackMbps.toStringAsFixed(2)} MB/s',
       );

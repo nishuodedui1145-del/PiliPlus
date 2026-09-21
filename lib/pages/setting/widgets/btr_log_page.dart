@@ -31,6 +31,7 @@ class _BtrLogPageState extends State<BtrLogPage> {
   }
 
   void _scrollToBottom() {
+    if (!mounted) return;
     if (_scrollController.hasClients) {
       _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
     }
@@ -43,12 +44,14 @@ class _BtrLogPageState extends State<BtrLogPage> {
     }
     final text = _logs.join('\n');
     await Clipboard.setData(ClipboardData(text: text));
+    if (!mounted) return;
     SmartDialog.showToast('已复制 ${_logs.length} 行日志到剪贴板');
   }
 
   void _clear() {
     if (_logs.isEmpty) return;
     BtrLog.clear();
+    if (!mounted) return;
     setState(() {
       _logs = BtrLog.snapshot();
     });
@@ -56,6 +59,7 @@ class _BtrLogPageState extends State<BtrLogPage> {
   }
 
   void _refresh() {
+    if (!mounted) return;
     setState(() {
       _logs = BtrLog.snapshot();
     });
@@ -77,15 +81,15 @@ class _BtrLogPageState extends State<BtrLogPage> {
             icon: const Icon(Icons.refresh_outlined),
             onPressed: _refresh,
           ),
-          TextButton.icon(
+          IconButton(
+            tooltip: '复制全部',
+            icon: const Icon(Icons.copy_all_outlined),
             onPressed: _copyAll,
-            icon: const Icon(Icons.copy_all_outlined, size: 18),
-            label: const Text('复制全部'),
           ),
-          TextButton.icon(
+          IconButton(
+            tooltip: '清空',
+            icon: const Icon(Icons.delete_outline),
             onPressed: _clear,
-            icon: const Icon(Icons.delete_outline, size: 18),
-            label: const Text('清空'),
           ),
           const SizedBox(width: 8),
         ],

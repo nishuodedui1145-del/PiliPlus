@@ -12,8 +12,7 @@ import 'package:PiliPlus/services/btr_proxy/multi_range_downloader.dart';
 import 'package:PiliPlus/services/btr_proxy/range_core.dart';
 import 'package:PiliPlus/services/btr_proxy/sidx_parser.dart';
 import 'package:PiliPlus/utils/accounts.dart';
-import 'package:flutter/foundation.dart'
-    show debugPrint, visibleForTesting;
+import 'package:flutter/foundation.dart' show visibleForTesting;
 
 /// 全局在途 Socket 预算承载器（对齐官方 idm-downloader.js:402-407）
 ///
@@ -946,11 +945,9 @@ class BtrProxyServer {
       if (bytesSent) {
         requestError = e;
         token.cancel(e);
-        {
-          debugPrint(
-            '[BTR] 响应已发送部分数据后检测到不支持 Range (${BtrLog.redact(e)})，中止连接',
-          );
-        }
+        BtrLog.log(
+          '[BTR] 响应已发送部分数据后检测到不支持 Range (${BtrLog.redact(e)})，中止连接',
+        );
       } else {
         // 识别上游不支持/忽略 Range，标记降级直连（对齐官方 page-hook.js:1074-1081）
         // ⚠️ 官方那个 3500ms 宽限期必须做成"时间戳"，**不能在这里 await**：

@@ -3,7 +3,6 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
-import 'package:flutter/foundation.dart' show debugPrint;
 
 import 'package:PiliPlus/services/btr_proxy/cdn_pool.dart';
 import 'package:PiliPlus/services/btr_proxy/range_core.dart';
@@ -468,15 +467,13 @@ class MultiRangeDownloader {
           final elapsedSec = elapsedMs / 1000.0;
           final expectedSec = expectedMs / 1000.0;
           final strikes = pool.recordSemiDead(url);
-          {
-            debugPrint(
-              '[BTR] 节点半死 piece#${piece.index} '
-              '耗时 ${elapsedSec.toStringAsFixed(2)}s'
-              '（期望 ${expectedSec.toStringAsFixed(2)}s）'
-              '来源=${BtrLog.hostOf(url)}，'
-              'strike=$strikes/${pool.banList.strikeLimit}',
-            );
-          }
+          BtrLog.log(
+            '[BTR] 节点半死 piece#${piece.index} '
+            '耗时 ${elapsedSec.toStringAsFixed(2)}s'
+            '（期望 ${expectedSec.toStringAsFixed(2)}s）'
+            '来源=${BtrLog.hostOf(url)}，'
+            'strike=$strikes/${pool.banList.strikeLimit}',
+          );
         }
       }
 
@@ -982,9 +979,7 @@ class MultiRangeDownloader {
         }
       } catch (e) {
         if (e is UpstreamHttpException) rethrow;
-        {
-          debugPrint('[BTR] HEAD probe failed on ${BtrLog.hostOf(url)}: ${BtrLog.redact(e)}');
-        }
+        BtrLog.log('[BTR] HEAD probe failed on ${BtrLog.hostOf(url)}: ${BtrLog.redact(e)}');
       } finally {
         token.removeListener(onCancel);
         release();
@@ -1955,13 +1950,11 @@ class _SlidingWindowStreamer {
         caller: 'passthrough',
       );
       try {
-        {
-          debugPrint(
-            '[BTR] 降级单连接顺序透传启动 (尝试 ${attempt + 1}/$maxPassthroughRetries): '
-            'url=${BtrLog.hostOf(url)}, range=bytes=$currentStart-$end'
-            '（本视频第 ${pool.singleConnectionSwitchCount} 次切单连接）',
-          );
-        }
+        BtrLog.log(
+          '[BTR] 降级单连接顺序透传启动 (尝试 ${attempt + 1}/$maxPassthroughRetries): '
+          'url=${BtrLog.hostOf(url)}, range=bytes=$currentStart-$end'
+          '（本视频第 ${pool.singleConnectionSwitchCount} 次切单连接）',
+        );
 
         final uri = Uri.parse(url);
         final cleanUri = Uri(scheme: uri.scheme, host: uri.host, path: uri.path);
@@ -2113,11 +2106,9 @@ class _SlidingWindowStreamer {
         if (switchedBack) {
           final nextStart = currentStart;
           if (nextStart <= end) {
-            {
-              debugPrint(
-                '[BTR] 单连接降速切回多并发: 剩余 bytes=$nextStart-$end',
-              );
-            }
+            BtrLog.log(
+              '[BTR] 单连接降速切回多并发: 剩余 bytes=$nextStart-$end',
+            );
             final remPieces = RangeCore.splitRange(
               nextStart,
               end,
@@ -2143,12 +2134,10 @@ class _SlidingWindowStreamer {
         }
 
         if (currentStart > end || resp.statusCode == HttpStatus.ok) {
-          {
-            debugPrint(
-              '[BTR] 降级单连接顺序透传成功完成: 传输 ${currentStart - start} 字节, '
-              '区间=bytes=$start-$end',
-            );
-          }
+          BtrLog.log(
+            '[BTR] 降级单连接顺序透传成功完成: 传输 ${currentStart - start} 字节, '
+            '区间=bytes=$start-$end',
+          );
           return;
         }
 
@@ -2160,20 +2149,16 @@ class _SlidingWindowStreamer {
       } catch (e) {
         lastError = e;
         if (token.isCancelled || e is UpstreamHttpException) rethrow;
-        {
-          debugPrint('[BTR] 降级单连接顺序透传尝试 ${attempt + 1} 失败: ${BtrLog.redact(e)}');
-        }
+        BtrLog.log('[BTR] 降级单连接顺序透传尝试 ${attempt + 1} 失败: ${BtrLog.redact(e)}');
       } finally {
         token.removeListener(onCancel);
         release();
       }
     }
 
-    {
-      debugPrint(
-        '[BTR] 降级单连接顺序透传所有重试均失败: ${BtrLog.redact(lastError)}, 原因: 上游彻底不可用',
-      );
-    }
+    BtrLog.log(
+      '[BTR] 降级单连接顺序透传所有重试均失败: ${BtrLog.redact(lastError)}, 原因: 上游彻底不可用',
+    );
     throw lastError ?? Exception('降级单连接顺序透传失败：上游彻底不可用');
   }
 }

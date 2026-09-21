@@ -464,6 +464,7 @@ abstract final class RangeCore {
 /// BTR 诊断埋点日志工具（支持限流与 URL 脱敏截断，内置 2000 行环形缓冲）
 abstract final class BtrLog {
   static const int maxCapacity = 2000;
+  static const int maxRateLimitKeys = 512;
   static final ListQueue<String> _buffer = ListQueue<String>();
   static final Map<String, int> _lastLogTimeMs = {};
 
@@ -473,9 +474,10 @@ abstract final class BtrLog {
   /// 日志快照：返回最近最多 2000 行日志的只读副本
   static List<String> snapshot() => List<String>.from(_buffer);
 
-  /// 清空日志环形缓冲
+  /// 清空日志环形缓冲与限流记录
   static void clear() {
     _buffer.clear();
+    _lastLogTimeMs.clear();
   }
 
   static void _append(String safeMessage) {
@@ -535,7 +537,7 @@ abstract final class BtrLog {
     }
   }
 
-  /// 普通调试日志输出（经过 redact 脱敏，进环形缓冲；kDebugMode 下同时输出到控制台）
+  /// 普通调试日志输出（经过 redact 脱敏，进环形缓冲并输出到控制台；发布版同样输出，便于真机 logcat 诊断）
   static void log(String message) {
     final safe = redact(message);
     _append(safe);
@@ -544,7 +546,7 @@ abstract final class BtrLog {
     }
   }
 
-  /// 限流日志输出：同 key 每条日志最多 1 次/秒（经过 redact 脱敏，进环形缓冲；kDebugMode 下同时输出到控制台）
+  /// 限流日志输出：同 key 每条日志最多 1 次/秒（经过 redact 脱敏，进环形缓冲并输出到控制台；发布版同样输出，便于真机 logcat 诊断）
   static void rateLimitedLog(
     String key,
     String message, {
@@ -553,6 +555,10 @@ abstract final class BtrLog {
     final now = DateTime.now().millisecondsSinceEpoch;
     final last = _lastLogTimeMs[key] ?? 0;
     if (now - last >= minIntervalMs) {
+      if (_lastLogTimeMs.length >= maxRateLimitKeys &&
+          !_lastLogTimeMs.containsKey(key)) {
+        _lastLogTimeMs.clear();
+      }
       _lastLogTimeMs[key] = now;
       final safe = redact(message);
       _append(safe);
