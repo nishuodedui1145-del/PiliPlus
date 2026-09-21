@@ -58,6 +58,8 @@ class BtrProxyServer {
   final Map<String, int> _totalLengthCache = {};
   int? _lastConfiguredConcurrency;
   Timer? _scheduledStopTimer;
+  int _stopRetryCount = 0;
+  static const int _maxStopRetries = 4; // 最多重排 4 次（初始 5s + 4*3s = 17s 硬截止）
   final GlobalSocketBudget socketBudget = GlobalSocketBudget();
   final Set<String> _inFlightSidxPrefetches = {};
   final Map<String, int> _sidxPrefetchFailedExpiry = {};
@@ -82,12 +84,56 @@ class BtrProxyServer {
       ..connectionTimeout = const Duration(seconds: 8);
   }
 
+  static final Expando<bool> _terminatedResponses = Expando<bool>();
+
+  /// 安全且幂等地断开下游客户端响应：
+  /// - [force]: 若为 true（如连续停滞放弃、传输中途异常、被取消等硬断场景），
+  ///   优先 detachSocket 并在底层 TCP socket 上执行 destroy()，
+  ///   强制向客户端发送 RST，立即切断客户端挂起的读取流；
+  ///   若 detach 失败则降级 close()。
+  /// - [force] 为 false（正常传输结束）：优雅 close()。
+  /// 幂等保证：利用 [Expando] 记录已收尾的 response，重复调用立即 no-op，绝不抛异常。
+  static Future<void> _terminateResponse(
+    HttpResponse response, {
+    required bool force,
+  }) async {
+    if (_terminatedResponses[response] == true) {
+      return;
+    }
+    _terminatedResponses[response] = true;
+
+    if (force) {
+      try {
+        final socket = await response.detachSocket(writeHeaders: false);
+        socket.destroy();
+        return;
+      } catch (_) {
+        // detachSocket 失败（例如 headers 尚未开始写或已被关闭），降级尝试 close
+      }
+    }
+
+    try {
+      await response.close();
+    } catch (_) {
+      try {
+        final socket = await response.detachSocket(writeHeaders: false);
+        socket.destroy();
+      } catch (_) {}
+    }
+  }
+
   /// 延迟停止代理服务器（默认 5 秒）
   ///
   /// 用于页面销毁（如 onClose）时避免立即掐断端口，导致新打开的视频在路由切换期间因旧端口失效而失败；
-  /// 期间若收到新的 ensureStarted() 或新的客户端请求，将立即取消定时器。若已有待执行停止，只刷新定时器。
+  /// 期间若收到新的 ensureStarted() 或新的客户端请求，将立即取消定时器。
+  /// 同一时刻只允许一个 pending 的 stop 定时器（重复 scheduleStop 不应叠加多个）。
   void scheduleStop({Duration delay = const Duration(seconds: 5)}) {
-    _scheduledStopTimer?.cancel();
+    if (_scheduledStopTimer != null) {
+      BtrLog.log(
+        '[BTR] 代理生命周期: scheduleStop 已有待执行定时器，跳过重复排程 端口=${_server?.port ?? 0} 在途=${_activeTokens.length}',
+      );
+      return;
+    }
     BtrLog.log(
       '[BTR] 代理生命周期: 事件=scheduleStop 端口=${_server?.port ?? 0} 在途=${_activeTokens.length}',
     );
@@ -99,10 +145,11 @@ class BtrProxyServer {
 
   /// 取消待执行的延迟停止定时器
   bool _cancelScheduledStop(String reason) {
+    _stopRetryCount = 0;
     if (_scheduledStopTimer != null) {
       _scheduledStopTimer?.cancel();
       _scheduledStopTimer = null;
-      BtrLog.log('[BTR] 代理停止已被新视频取消（延迟停止已撤销）');
+      BtrLog.log('[BTR] 代理停止已被新视频取消（延迟停止已撤销，原因=$reason）');
       BtrLog.log(
         '[BTR] 代理生命周期: 事件=cancelStop 端口=${_server?.port ?? 0} 在途=${_activeTokens.length}',
       );
@@ -167,22 +214,50 @@ class BtrProxyServer {
     _scheduledStopTimer = null;
 
     if (!force) {
-      if (_activeTokens.isNotEmpty) {
-        BtrLog.log(
-          '[BTR] 代理停止跳过: 仍有在途请求 (${_activeTokens.length} 个)',
-        );
-        scheduleStop(delay: const Duration(seconds: 3));
-        return;
-      }
-      final now = DateTime.now().millisecondsSinceEpoch;
-      if (_lastRequestTimestamp > 0 && now - _lastRequestTimestamp < 3000) {
-        BtrLog.log(
-          '[BTR] 代理停止跳过: 最近 ${(now - _lastRequestTimestamp)}ms 内有活跃请求',
-        );
-        scheduleStop(delay: const Duration(seconds: 3));
-        return;
+      final inFlight = _activeTokens.length;
+      if (inFlight > 0) {
+        if (_stopRetryCount < _maxStopRetries) {
+          _stopRetryCount++;
+          BtrLog.log(
+            '[BTR] 代理停止跳过: 仍有在途请求 ($inFlight 个)，第 $_stopRetryCount/$_maxStopRetries 次重排',
+          );
+          _scheduledStopTimer = Timer(const Duration(seconds: 3), () {
+            _scheduledStopTimer = null;
+            stop(force: false);
+          });
+          return;
+        } else {
+          BtrLog.log(
+            '[BTR] 代理强制停止: 在途=$inFlight 超时',
+          );
+          for (final token in List.of(_activeTokens)) {
+            try {
+              token.cancel('代理强制停止: 在途超时');
+            } catch (e) {
+              BtrLog.log('[BTR] 强制取消在途连接异常: ${BtrLog.redact(e)}');
+            }
+          }
+          _activeTokens.clear();
+        }
+      } else {
+        final now = DateTime.now().millisecondsSinceEpoch;
+        if (_lastRequestTimestamp > 0 && now - _lastRequestTimestamp < 3000) {
+          if (_stopRetryCount < _maxStopRetries) {
+            _stopRetryCount++;
+            BtrLog.log(
+              '[BTR] 代理停止跳过: 最近 ${(now - _lastRequestTimestamp)}ms 内有活跃请求，第 $_stopRetryCount/$_maxStopRetries 次重排',
+            );
+            _scheduledStopTimer = Timer(const Duration(seconds: 3), () {
+              _scheduledStopTimer = null;
+              stop(force: false);
+            });
+            return;
+          }
+        }
       }
     }
+
+    _stopRetryCount = 0;
 
     if (_stopping != null) {
       return _stopping!;
@@ -232,6 +307,9 @@ class BtrProxyServer {
 
   /// 切视频或退出时重置所有活跃请求与缓存，释放复用的 HttpClient 连接池
   void resetForNewVideo() {
+    _scheduledStopTimer?.cancel();
+    _scheduledStopTimer = null;
+    _stopRetryCount = 0;
     BtrLog.log(
       '[BTR] 代理生命周期: 事件=reset 端口=${_server?.port ?? 0} 在途=${_activeTokens.length}',
     );
@@ -390,91 +468,98 @@ class BtrProxyServer {
     _activeTokens.add(token);
     bool bytesSent = false;
     Object? requestError;
+    bool sinkClosed = false;
+    bool sinkErrored = false;
 
     // 监听客户端连接是否中断
     request.response.done.then((_) {
+      sinkClosed = true;
       token.cancel('Client finished or closed socket');
       _activeTokens.remove(token);
     }, onError: (err) {
+      sinkErrored = true;
       token.cancel('Client connection closed with error: $err');
       _activeTokens.remove(token);
     });
 
-    final groupParam = request.uri.queryParameters['g'];
-    final group = groupParam ?? 'auto';
-    if (kind == 'video') {
-      lastSampleUrl = targetUrl;
-      lastGroup = group;
-    }
+    CdnPool? activePool;
+    var isRetakeoverAttempt = false;
+    late final CdnPool pool;
+    late final Map<String, String> headers;
+    late final MultiRangeDownloader downloader;
+    try {
+      final groupParam = request.uri.queryParameters['g'];
+      final group = groupParam ?? 'auto';
+      if (kind == 'video') {
+        lastSampleUrl = targetUrl;
+        lastGroup = group;
+      }
 
-    final pool = _cdnPoolCache.putIfAbsent(
-      targetUrl,
-      () => CdnPool(
-        originalUrls: [targetUrl],
-        // 用户在设置里指定的节点分组偏好（对应官方「CDN 模式」）
-        preferredGroup: switch (groupParam) {
-          'mainland' => CdnGroup.mainland,
-          'overseas' => CdnGroup.overseas,
-          _ => null,
-        },
-      ),
-    );
+      pool = _cdnPoolCache.putIfAbsent(
+        targetUrl,
+        () => CdnPool(
+          originalUrls: [targetUrl],
+          // 用户在设置里指定的节点分组偏好（对应官方「CDN 模式」）
+          preferredGroup: switch (groupParam) {
+            'mainland' => CdnGroup.mainland,
+            'overseas' => CdnGroup.overseas,
+            _ => null,
+          },
+        ),
+      );
+      activePool = pool;
 
-    // CDN 自动竞速调度（只在启用且为 GET 请求时触发；后台异步进行，绝不阻塞起播）
-    if (cdnRaceEnabled && request.method == 'GET') {
-      if (!pool.hasRacerHint) {
-        if (racer.isFresh) {
-          final cached = racer.cached!;
-          final ageSec =
-              (DateTime.now().millisecondsSinceEpoch - cached.measuredAtMs) ~/
-                  1000;
-          BtrLog.log(
-            '[BTR] CDN 竞速: 复用缓存（测于 $ageSec 秒前）最优=${cached.host}',
-          );
-          pool.applyRacerHint(cached.host, cached.bytesPerSec);
-          BtrLog.log(
-            '[BTR] CDN 竞速: 最优已应用于候选池 host=${cached.host} '
-            '估计=${(cached.bytesPerSec / 1048576).toStringAsFixed(2)} MB/s',
-          );
-        } else {
-          // 缓存过期或首次竞速：后台跑竞速（绝不阻塞当前播放）
-          _triggerBackgroundRace(
-            sampleUrl: targetUrl,
-            group: group,
-            pool: pool,
-          );
+      // CDN 自动竞速调度（只在启用且为 GET 请求时触发；后台异步进行，绝不阻塞起播）
+      if (cdnRaceEnabled && request.method == 'GET') {
+        if (!pool.hasRacerHint) {
+          if (racer.isFresh) {
+            final cached = racer.cached!;
+            final ageSec =
+                (DateTime.now().millisecondsSinceEpoch - cached.measuredAtMs) ~/
+                    1000;
+            BtrLog.log(
+              '[BTR] CDN 竞速: 复用缓存（测于 $ageSec 秒前）最优=${cached.host}',
+            );
+            pool.applyRacerHint(cached.host, cached.bytesPerSec);
+            BtrLog.log(
+              '[BTR] CDN 竞速: 最优已应用于候选池 host=${cached.host} '
+              '估计=${(cached.bytesPerSec / 1048576).toStringAsFixed(2)} MB/s',
+            );
+          } else {
+            // 缓存过期或首次竞速：后台跑竞速（绝不阻塞当前播放）
+            _triggerBackgroundRace(
+              sampleUrl: targetUrl,
+              group: group,
+              pool: pool,
+            );
+          }
         }
       }
-    }
 
-    final cookie = await _getLoginCookie();
-    final headers = <String, String>{
-      HttpHeaders.userAgentHeader: BrowserUa.pc,
-      HttpHeaders.refererHeader: '${HttpString.baseUrl}/',
-      if (cookie != null && cookie.isNotEmpty) HttpHeaders.cookieHeader: cookie,
-      HttpHeaders.acceptHeader: '*/*',
-    };
+      final cookie = await _getLoginCookie();
+      headers = <String, String>{
+        HttpHeaders.userAgentHeader: BrowserUa.pc,
+        HttpHeaders.refererHeader: '${HttpString.baseUrl}/',
+        if (cookie != null && cookie.isNotEmpty) HttpHeaders.cookieHeader: cookie,
+        HttpHeaders.acceptHeader: '*/*',
+      };
 
-    // E: 复用 HttpClient 与 MultiRangeDownloader 实例
-    final client = _getOrCreateHttpClient();
-    final initialConcurrency = pool.adaptiveConcurrency ?? allocatedThreads;
-    final downloaderKey = '$targetUrl#$kind';
-    final downloader = _downloaderCache.putIfAbsent(
-      downloaderKey,
-      () => MultiRangeDownloader(
-        concurrency: initialConcurrency,
-        maxInFlightSockets: maxSockets,
-        httpClient: client,
-        defaultHeaders: headers,
-      ),
-    )
-      ..defaultHeaders = headers
-      ..setConcurrency(initialConcurrency, maxInFlightSockets: maxSockets);
+      // E: 复用 HttpClient 与 MultiRangeDownloader 实例
+      final client = _getOrCreateHttpClient();
+      final initialConcurrency = pool.adaptiveConcurrency ?? allocatedThreads;
+      final downloaderKey = '$targetUrl#$kind';
+      downloader = _downloaderCache.putIfAbsent(
+        downloaderKey,
+        () => MultiRangeDownloader(
+          concurrency: initialConcurrency,
+          maxInFlightSockets: maxSockets,
+          httpClient: client,
+          defaultHeaders: headers,
+        ),
+      )
+        ..defaultHeaders = headers
+        ..setConcurrency(initialConcurrency, maxInFlightSockets: maxSockets);
 
-    // P1-5: 重接管试探标记必须在 try 之前声明 —— 它要在 finally 里被读（复位 isRetakeoverInProgress），
-    //        声明在 try 内部的话 catch/finally 作用域看不到（Dart 作用域规则）。
-    var isRetakeoverAttempt = false;
-    try {
       // 检查是否处于降级直连状态（对齐官方 page-hook.js:140-158 / 1074-1081）
       if (pool.isDirectPassthrough && request.method == 'GET') {
         if (!pool.isRetakeoverInProgress && pool.checkRetakeoverEligible()) {
@@ -491,6 +576,7 @@ class BtrProxyServer {
             token: token,
             defaultHeaders: headers,
             onByteSent: () => bytesSent = true,
+            onSinkError: () => sinkErrored = true,
             pool: pool,
             downloader: downloader,
           );
@@ -758,11 +844,16 @@ class BtrProxyServer {
           HttpHeaders.contentTypeHeader,
           'video/mp4',
         );
-        if (primerBytes.isNotEmpty) {
-          request.response.add(primerBytes);
+        if (primerBytes.isNotEmpty && !sinkErrored && !sinkClosed) {
+          try {
+            request.response.add(primerBytes);
+            await request.response.flush();
+            bytesSent = true;
+          } catch (e) {
+            sinkErrored = true;
+            rethrow;
+          }
         }
-        await request.response.flush();
-        bytesSent = true;
         BtrLog.log(
           '[BTR] 首响应超时（>${RangeCore.firstResponseDeadline.inMilliseconds}ms）'
           '→ 用 ${primerBytes.length} 字节顶出响应头（总长度未知，退化为 200）: '
@@ -779,6 +870,7 @@ class BtrProxyServer {
           defaultHeaders: headers,
           fromOffset: nextOffset,
           onByteSent: () => bytesSent = true,
+          onSinkError: () => sinkErrored = true,
           downloader: downloader,
           pool: pool,
         );
@@ -870,9 +962,16 @@ class BtrProxyServer {
       }
 
       // 先把探测到的 head 数据按序写出给客户端
-      request.response.add(probe.headBytes);
-      await request.response.flush();
-      bytesSent = true;
+      if (!sinkErrored && !sinkClosed) {
+        try {
+          request.response.add(probe.headBytes);
+          await request.response.flush();
+          bytesSent = true;
+        } catch (e) {
+          sinkErrored = true;
+          rethrow;
+        }
+      }
 
       // 若处于重接管中且成功发送数据，恢复加速状态
       if (pool.isDirectPassthrough || isRetakeoverAttempt) {
@@ -933,10 +1032,17 @@ class BtrProxyServer {
             maxInFlightSockets: maxSockets,
             v1Bps: effectiveV1,
             originalThreads: allocatedThreads,
+            kind: kind,
             onOrderedChunk: (chunk) async {
-              request.response.add(chunk);
-              await request.response.flush();
-              bytesSent = true;
+              if (sinkErrored || sinkClosed) return;
+              try {
+                request.response.add(chunk);
+                await request.response.flush();
+                bytesSent = true;
+              } catch (e) {
+                sinkErrored = true;
+                rethrow;
+              }
             },
           );
         }
@@ -967,6 +1073,7 @@ class BtrProxyServer {
             token: token,
             defaultHeaders: headers,
             onByteSent: () => bytesSent = true,
+            onSinkError: () => sinkErrored = true,
             pool: pool,
             downloader: downloader,
           );
@@ -992,25 +1099,19 @@ class BtrProxyServer {
         } catch (_) {}
       }
     } finally {
-      if (isRetakeoverAttempt) {
-        pool.isRetakeoverInProgress = false;
+      if (isRetakeoverAttempt && activePool != null) {
+        activePool.isRetakeoverInProgress = false;
       }
-      // 统一唯一 close 责任处，彻底消除 double-close
+      // 统一唯一收尾责任处，由 _terminateResponse 保证严格幂等
       _activeTokens.remove(token);
-      if (requestError != null && bytesSent) {
-        BtrLog.log('[BTR] 传输过程中出错，中止连接: ${BtrLog.redact(requestError)}');
-        try {
-          final socket = await request.response.detachSocket(writeHeaders: false);
-          socket.destroy();
-        } catch (_) {
-          try {
-            await request.response.close();
-          } catch (_) {}
-        }
+      final hasError = requestError != null || token.isCancelled;
+      if (hasError && bytesSent) {
+        BtrLog.log(
+          '[BTR] 传输过程中出错，硬断连接: ${BtrLog.redact(requestError ?? token.reason)}',
+        );
+        await _terminateResponse(request.response, force: true);
       } else {
-        try {
-          await request.response.close();
-        } catch (_) {}
+        await _terminateResponse(request.response, force: false);
       }
     }
   }
@@ -1237,6 +1338,7 @@ class BtrProxyServer {
     required CancellationToken token,
     required Map<String, String> defaultHeaders,
     void Function()? onByteSent,
+    void Function()? onSinkError,
     CdnPool? pool,
     MultiRangeDownloader? downloader,
     Duration firstByteTimeout = RangeCore.firstByteTimeout,
@@ -1246,18 +1348,17 @@ class BtrProxyServer {
     final release = downloader != null
         ? await downloader.acquireSocket(token, priority: 150, caller: 'proxy_passthrough')
         : null;
-    final uri = Uri.parse(targetUrl);
-    final client = _getOrCreateHttpClient();
-
     HttpClientRequest? currentReq;
     void onCancel() {
       try {
         currentReq?.abort();
       } catch (_) {}
     }
-    token.addListener(onCancel);
 
     try {
+      token.addListener(onCancel);
+      final uri = Uri.parse(targetUrl);
+      final client = _getOrCreateHttpClient();
       final upstreamReq = await client.openUrl(clientRequest.method, uri);
       currentReq = upstreamReq;
       defaultHeaders.forEach((k, v) {
@@ -1326,6 +1427,7 @@ class BtrProxyServer {
         endOffset: endOffset,
         maxBytes: maxBytes,
         onByteSent: onByteSent,
+        onSinkError: onSinkError,
         pool: pool,
         onRequestChanged: (req) => currentReq = req,
         stallTimeout: stallTimeout,
@@ -1396,6 +1498,7 @@ class BtrProxyServer {
     int? fromOffset,
     int? endOffset,
     void Function()? onByteSent,
+    void Function()? onSinkError,
     MultiRangeDownloader? downloader,
     CdnPool? pool,
     Duration firstByteTimeout = RangeCore.firstByteTimeout,
@@ -1405,29 +1508,29 @@ class BtrProxyServer {
     final release = downloader != null
         ? await downloader.acquireSocket(token, priority: 150, caller: 'stream_direct')
         : null;
-    final uri = Uri.parse(targetUrl);
-    final client = _getOrCreateHttpClient();
-
     HttpClientRequest? currentReq;
     void onCancel() {
       try {
         currentReq?.abort();
       } catch (_) {}
     }
-    token.addListener(onCancel);
-
-    final clientRange = clientRequest.headers.value(HttpHeaders.rangeHeader);
-    final parsedRange = RangeCore.parseRangeHeader(clientRange);
-    final effectiveBase = fromOffset ?? (parsedRange?.start ?? 0);
-    final effectiveEnd = endOffset ?? parsedRange?.end;
-
-    // 已经给客户端声明了 Content-Length 时，**绝不能多写一个字节**
-    // （上游有时不严格按 Range 裁剪，会多给数据 → 写成超出长度会破坏响应）
-    final maxBytes = (effectiveEnd != null && fromOffset != null)
-        ? (effectiveEnd - fromOffset + 1)
-        : (effectiveEnd != null ? (effectiveEnd - effectiveBase + 1) : null);
 
     try {
+      token.addListener(onCancel);
+      final uri = Uri.parse(targetUrl);
+      final client = _getOrCreateHttpClient();
+
+      final clientRange = clientRequest.headers.value(HttpHeaders.rangeHeader);
+      final parsedRange = RangeCore.parseRangeHeader(clientRange);
+      final effectiveBase = fromOffset ?? (parsedRange?.start ?? 0);
+      final effectiveEnd = endOffset ?? parsedRange?.end;
+
+      // 已经给客户端声明了 Content-Length 时，**绝不能多写一个字节**
+      // （上游有时不严格按 Range 裁剪，会多给数据 → 写成超出长度会破坏响应）
+      final maxBytes = (effectiveEnd != null && fromOffset != null)
+          ? (effectiveEnd - fromOffset + 1)
+          : (effectiveEnd != null ? (effectiveEnd - effectiveBase + 1) : null);
+
       final upstreamReq = await client.openUrl(clientRequest.method, uri);
       currentReq = upstreamReq;
       defaultHeaders.forEach((k, v) {
@@ -1476,6 +1579,7 @@ class BtrProxyServer {
         endOffset: effectiveEnd,
         maxBytes: maxBytes,
         onByteSent: onByteSent,
+        onSinkError: onSinkError,
         pool: pool,
         onRequestChanged: (req) => currentReq = req,
         stallTimeout: stallTimeout,
@@ -1500,6 +1604,7 @@ class BtrProxyServer {
     required int? endOffset,
     required int? maxBytes,
     void Function()? onByteSent,
+    void Function()? onSinkError,
     CdnPool? pool,
     void Function(HttpClientRequest? req)? onRequestChanged,
     Duration stallTimeout = RangeCore.stallTimeout,
@@ -1522,61 +1627,61 @@ class BtrProxyServer {
           pool.videoBitrateBytesPerSec! > 0;
       final targetMbps = (targetBps / (1024 * 1024)).toStringAsFixed(2);
       BtrLog.rateLimitedLog(
-        'mode_criteria',
+        'mode_criteria_${pool.anchorHost ?? "direct"}',
         '[BTR] 模式判据: 码率已知=$bitrateKnown target=$targetMbps MB/s',
       );
     }
 
     final stallWatch = Stopwatch();
 
+    StreamSubscription<List<int>>? currentSub;
+    Completer<void>? activeRoundCompleter;
+    Timer? currentStallTimer;
+
+    void onWatchdogTokenCancel() {
+      currentStallTimer?.cancel();
+      try {
+        currentSub?.cancel();
+      } catch (_) {}
+      try {
+        currentReq?.abort();
+      } catch (_) {}
+      if (activeRoundCompleter != null && !activeRoundCompleter.isCompleted) {
+        activeRoundCompleter.completeError(CancellationException(token.reason));
+      }
+    }
+
+    token.addListener(onWatchdogTokenCancel);
+
     try {
       while (!earlyExit) {
         token.throwIfCancelled();
 
         bool isStalled = false;
+        final roundCompleter = Completer<void>();
+        activeRoundCompleter = roundCompleter;
         bool isDone = false;
         bool cancelledByUs = false;
-        StreamSubscription<List<int>>? sub;
-        final roundCompleter = Completer<void>();
-        Timer? stallTimer;
 
+        Timer? stallTimer;
         void resetStallTimer() {
           stallTimer?.cancel();
-          stallWatch
-            ..reset()
-            ..start();
-          stallTimer = Timer(stallTimeout, () async {
+          stallTimer = Timer(stallTimeout, () {
             isStalled = true;
             cancelledByUs = true;
-            try {
-              await sub?.cancel();
-            } catch (_) {}
-            try {
-              currentReq?.abort();
-            } catch (_) {}
-            if (!roundCompleter.isCompleted) {
-              roundCompleter.complete();
-            }
+            roundCompleter.complete();
           });
+          currentStallTimer = stallTimer;
         }
 
+        StreamSubscription<List<int>>? sub;
         sub = currentResp.listen(
           (chunk) async {
+            currentSub = sub;
             resetStallTimer();
-            if (token.isCancelled) {
-              cancelledByUs = true;
-              await sub?.cancel();
-              if (!roundCompleter.isCompleted) {
-                try {
-                  token.throwIfCancelled();
-                } catch (e, st) {
-                  roundCompleter.completeError(e, st);
-                }
-              }
-              return;
-            }
-
+            stallWatch.reset();
             sub?.pause();
+
             try {
               var data = chunk;
               if (maxBytes != null) {
@@ -1596,10 +1701,15 @@ class BtrProxyServer {
                 }
               }
 
-              clientRequest.response.add(data);
-              written += data.length;
-              await clientRequest.response.flush();
-              onByteSent?.call();
+              try {
+                clientRequest.response.add(data);
+                written += data.length;
+                await clientRequest.response.flush();
+                onByteSent?.call();
+              } catch (e) {
+                onSinkError?.call();
+                rethrow;
+              }
 
               intervalBytes += data.length;
               if (intervalBytes >= 1024 * 1024 ||
@@ -1675,6 +1785,9 @@ class BtrProxyServer {
         try {
           await roundCompleter.future;
         } finally {
+          activeRoundCompleter = null;
+          currentSub = null;
+          currentStallTimer = null;
           stallTimer?.cancel();
           try {
             await sub.cancel();
@@ -1692,9 +1805,7 @@ class BtrProxyServer {
 
           if (stallRetries > maxStallRetries) {
             BtrLog.log('[BTR] 直连停滞放弃: 连续 3 次无数据，已断开本次响应');
-            try {
-              await clientRequest.response.close();
-            } catch (_) {}
+            await _terminateResponse(clientRequest.response, force: true);
             break;
           }
 
@@ -1752,12 +1863,20 @@ class BtrProxyServer {
           break;
         }
       }
-    } finally {
-      if (earlyExit || stallRetries > maxStallRetries) {
-        try {
-          currentReq?.abort();
-        } catch (_) {}
+    } catch (e) {
+      if (written > 0) {
+        await _terminateResponse(clientRequest.response, force: true);
       }
+      rethrow;
+    } finally {
+      token.removeListener(onWatchdogTokenCancel);
+      currentStallTimer?.cancel();
+      try {
+        currentSub?.cancel();
+      } catch (_) {}
+      try {
+        currentReq?.abort();
+      } catch (_) {}
     }
   }
 

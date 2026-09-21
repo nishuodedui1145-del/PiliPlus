@@ -70,12 +70,16 @@ class PrioritySemaphore {
   int limit;
   int _active = 0;
   int _sequence = 0;
+  int _totalAcquires = 0;
+  int _totalReleases = 0;
   final List<_SemaphoreEntry> _queue = [];
 
   PrioritySemaphore(this.limit);
 
   int get activeCount => _active;
   int get queueLength => _queue.length;
+  int get totalAcquires => _totalAcquires;
+  int get totalReleases => _totalReleases;
   bool get hasAvailableSlot => _active < limit;
 
   void setLimit(int newLimit) {
@@ -141,11 +145,24 @@ class PrioritySemaphore {
       }
 
       _active++;
+      _totalAcquires++;
       void release() {
         if (entry.released) return;
         entry.released = true;
+        _totalReleases++;
         if (entry.token != null && entry.cancelListener != null) {
           entry.token!.removeListener(entry.cancelListener!);
+        }
+        if (_active <= 0) {
+          BtrLog.log(
+            '[BTR] 警告: PrioritySemaphore 不变量违规: release 时 active=$_active <= 0 '
+            '(totalAcquires=$_totalAcquires, totalReleases=$_totalReleases)',
+          );
+        }
+        if (_totalReleases > _totalAcquires) {
+          BtrLog.log(
+            '[BTR] 槽位归还不平衡: acquired=$_totalAcquires released=$_totalReleases',
+          );
         }
         _active = max(0, _active - 1);
         _drain();
@@ -273,20 +290,21 @@ class MultiRangeDownloader {
 
     final innerToken = CancellationToken();
     void onParentCancel() => innerToken.cancel(token.reason);
-    token.addListener(onParentCancel);
-
     HttpClientRequest? currentRequest;
     Timer? firstByteTimer;
     Timer? stallTimer;
     Timer? totalTimer;
-
     int receivedBytes = 0;
     bool firstByteReceived = false;
     bool isFirstByteTimeout = false;
     final stopwatch = Stopwatch()..start();
 
+    void Function()? onInnerCancel;
+
     try {
-      token.throwIfCancelled();
+      token
+        ..addListener(onParentCancel)
+        ..throwIfCancelled();
 
       // 独立首字节超时：若在 5.5s 内未收到任何数据字节，立即掐掉请求并记 0 字节 strike
       firstByteTimer = Timer(RangeCore.firstByteTimeout, () {
@@ -432,9 +450,30 @@ class MultiRangeDownloader {
         cancelOnError: true,
       );
 
-      innerToken.addListener(() {
-        subscription.cancel();
-      });
+      onInnerCancel = () {
+        stallTimer?.cancel();
+        firstByteTimer?.cancel();
+        totalTimer?.cancel();
+        try {
+          subscription.cancel();
+        } catch (_) {}
+        if (!completer.isCompleted) {
+          if (isFirstByteTimeout) {
+            completer.completeError(
+              TimeoutException(
+                'CDN 首字节超时 (${RangeCore.firstByteTimeout.inMilliseconds}ms)',
+              ),
+            );
+          } else {
+            completer.completeError(CancellationException(innerToken.reason));
+          }
+        }
+      };
+
+      innerToken.addListener(onInnerCancel);
+      if (innerToken.isCancelled) {
+        onInnerCancel();
+      }
 
       final bodyBytes = await completer.future;
 
@@ -536,6 +575,12 @@ class MultiRangeDownloader {
       stallTimer?.cancel();
       totalTimer?.cancel();
       token.removeListener(onParentCancel);
+      if (onInnerCancel != null) {
+        innerToken.removeListener(onInnerCancel);
+      }
+      try {
+        currentRequest?.abort();
+      } catch (_) {}
       release();
     }
   }
@@ -939,9 +984,9 @@ class MultiRangeDownloader {
         } catch (_) {}
       }
 
-      token.addListener(onCancel);
       final release = await acquireSocket(token, priority: 200, caller: 'probe_head_fast');
       try {
+        token.addListener(onCancel);
         final uri = Uri.parse(url);
         req = (await _httpClient.openUrl('HEAD', uri))
           ..followRedirects = true
@@ -1073,7 +1118,12 @@ class MultiRangeDownloader {
       final batchTimeoutMs = min(remainingMs, RangeCore.startupProbeBatchTimeout.inMilliseconds);
       final batchCompleter = Completer<void>();
       final batchToken = CancellationToken();
-      void onParentCancel() => batchToken.cancel(token.reason);
+      void onParentCancel() {
+        batchToken.cancel(token.reason);
+        if (!batchCompleter.isCompleted) {
+          batchCompleter.complete();
+        }
+      }
       token.addListener(onParentCancel);
 
       var activeInBatch = batch.urls.length;
@@ -1304,6 +1354,7 @@ class MultiRangeDownloader {
     int? maxInFlightSockets,
     double v1Bps = 0.0,
     int? originalThreads,
+    String? kind,
     required Future<void> Function(Uint8List chunk) onOrderedChunk,
   }) async {
     final streamer = _SlidingWindowStreamer(
@@ -1316,6 +1367,7 @@ class MultiRangeDownloader {
       maxInFlightSockets: maxInFlightSockets ?? this.maxInFlightSockets,
       v1Bps: v1Bps,
       originalThreads: originalThreads,
+      kind: kind,
       onOrderedChunk: onOrderedChunk,
     );
     await streamer.stream();
@@ -1401,6 +1453,7 @@ class _SlidingWindowStreamer {
   final double v1Bps;
   final int originalThreads;
   final int _maxSockets;
+  final String kind;
   int limit;
   final Future<void> Function(Uint8List chunk) onOrderedChunk;
 
@@ -1432,9 +1485,11 @@ class _SlidingWindowStreamer {
   double _lastEvaluatedAggBps = 0.0;
 
   bool get isAggregateBelowTarget {
-    final targetBps =
+    final baseTargetBps =
         RangeCore.requiredThroughputBytesPerSec(pool.videoBitrateBytesPerSec);
-    if (targetBps <= 0) return true;
+    if (baseTargetBps <= 0) return true;
+    // 补保守下限（不低于 0.4 MB/s），避免低码率流抑制慢块补救 (Hedge)
+    final targetBps = max(baseTargetBps, RangeCore.singleAdequateFallbackBps);
     final currentBps = getCurrentAggregatedBps();
     return currentBps < targetBps;
   }
@@ -1471,8 +1526,10 @@ class _SlidingWindowStreamer {
     int? maxInFlightSockets,
     this.v1Bps = 0.0,
     int? originalThreads,
+    String? kind,
     required this.onOrderedChunk,
-  })  : _maxSockets = maxInFlightSockets ?? downloader.maxInFlightSockets,
+  })  : kind = kind ?? 'stream',
+        _maxSockets = maxInFlightSockets ?? downloader.maxInFlightSockets,
         originalThreads = originalThreads ?? concurrency,
         limit = (pool.adaptiveConcurrency ??
                 min(concurrency, RangeCore.maxRampConcurrency))
@@ -1788,8 +1845,8 @@ class _SlidingWindowStreamer {
                 pool.videoBitrateBytesPerSec! > 0;
             final targetMbps = (targetBps / (1024 * 1024)).toStringAsFixed(2);
             BtrLog.rateLimitedLog(
-              'mode_criteria',
-              '[BTR] 模式判据: 码率已知=$bitrateKnown target=$targetMbps MB/s',
+              'mode_criteria_$kind',
+              '[BTR] 模式判据($kind): 码率已知=$bitrateKnown target=$targetMbps MB/s',
             );
 
             final singleAdequate = v1 >= targetBps;
@@ -1937,12 +1994,19 @@ class _SlidingWindowStreamer {
       }
 
       HttpClientRequest? req;
+      StreamSubscription<List<int>>? subscription;
+      Completer<void>? activeCompleter;
       void onCancel() {
         try {
           req?.abort();
         } catch (_) {}
+        try {
+          subscription?.cancel();
+        } catch (_) {}
+        if (activeCompleter != null && !activeCompleter.isCompleted) {
+          activeCompleter.completeError(CancellationException(token.reason));
+        }
       }
-      token.addListener(onCancel);
 
       final release = await downloader.acquireSocket(
         token,
@@ -1950,6 +2014,7 @@ class _SlidingWindowStreamer {
         caller: 'passthrough',
       );
       try {
+        token.addListener(onCancel);
         BtrLog.log(
           '[BTR] 降级单连接顺序透传启动 (尝试 ${attempt + 1}/$maxPassthroughRetries): '
           'url=${BtrLog.hostOf(url)}, range=bytes=$currentStart-$end'
@@ -1994,7 +2059,7 @@ class _SlidingWindowStreamer {
         bool switchedBack = false;
 
         final completer = Completer<void>();
-        StreamSubscription<List<int>>? subscription;
+        activeCompleter = completer;
         try {
           subscription = resp.listen(
             (chunk) async {
@@ -2045,8 +2110,8 @@ class _SlidingWindowStreamer {
                       pool.videoBitrateBytesPerSec! > 0;
                   final targetMbps = (targetBps / (1024 * 1024)).toStringAsFixed(2);
                   BtrLog.rateLimitedLog(
-                    'mode_criteria',
-                    '[BTR] 模式判据: 码率已知=$bitrateKnown target=$targetMbps MB/s',
+                    'mode_criteria_$kind',
+                    '[BTR] 模式判据($kind): 码率已知=$bitrateKnown target=$targetMbps MB/s',
                   );
 
                   final unhooked = pool.recordSingleConnectionIntervalThroughput(
@@ -2100,7 +2165,9 @@ class _SlidingWindowStreamer {
 
           await completer.future;
         } finally {
+          activeCompleter = null;
           await subscription?.cancel().catchError((_) {});
+          subscription = null;
         }
 
         if (switchedBack) {
@@ -2125,6 +2192,7 @@ class _SlidingWindowStreamer {
                 maxInFlightSockets: _maxSockets,
                 v1Bps: 0.0,
                 originalThreads: originalThreads,
+                kind: kind,
                 onOrderedChunk: onOrderedChunk,
               );
               await subStreamer.stream();
