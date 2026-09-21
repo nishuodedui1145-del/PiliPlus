@@ -165,3 +165,5 @@ btr_reference/
 # 早期版本的端到端测试（已被 test/standalone/btr_proxy_e2e_test.dart 取代），不上传
 test/btr_proxy_e2e_test.dart
 # =========================================================
+# BTR：本地生成的分发补丁，不入库
+/BTR-PiliPlus.patch

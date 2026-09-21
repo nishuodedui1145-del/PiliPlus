@@ -1,6 +1,6 @@
 import 'dart:math';
 
-import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
+import 'package:flutter/foundation.dart' show debugPrint;
 
 import 'cdn_type.dart';
 
@@ -622,7 +622,6 @@ class CdnPool {
 
   /// 打印码率解析埋点日志（仅打印 host，严禁打印含签名的完整 URL）
   void _logBitrateParsing() {
-    if (!kDebugMode) return;
     final host = anchorHost;
     final hostPrefix = (host != null && host.isNotEmpty) ? 'host=$host, ' : '';
     final rate = videoBitrateBytesPerSec;

@@ -3,7 +3,7 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
-import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
+import 'package:flutter/foundation.dart' show debugPrint;
 
 import 'cdn_pool.dart';
 import 'range_core.dart';
@@ -468,7 +468,7 @@ class MultiRangeDownloader {
           final elapsedSec = elapsedMs / 1000.0;
           final expectedSec = expectedMs / 1000.0;
           final strikes = pool.recordSemiDead(url);
-          if (kDebugMode) {
+          {
             debugPrint(
               '[BTR] 节点半死 piece#${piece.index} '
               '耗时 ${elapsedSec.toStringAsFixed(2)}s'
@@ -512,15 +512,13 @@ class MultiRangeDownloader {
           final elapsedSec = elapsedMs / 1000.0;
           final expectedSec = expectedMs / 1000.0;
           final strikes = pool.recordSemiDead(url);
-          if (kDebugMode) {
-            debugPrint(
-              '[BTR] 节点半死 piece#${piece.index} '
-              '耗时 ${elapsedSec.toStringAsFixed(2)}s'
-              '（期望 ${expectedSec.toStringAsFixed(2)}s）'
-              '来源=${BtrLog.hostOf(url)}，'
-              'strike=$strikes/${pool.banList.strikeLimit}',
-            );
-          }
+          BtrLog.log(
+            '[BTR] 节点半死 piece#${piece.index} '
+            '耗时 ${elapsedSec.toStringAsFixed(2)}s'
+            '（期望 ${expectedSec.toStringAsFixed(2)}s）'
+            '来源=${BtrLog.hostOf(url)}，'
+            'strike=$strikes/${pool.banList.strikeLimit}',
+          );
         }
       }
 
@@ -984,7 +982,7 @@ class MultiRangeDownloader {
         }
       } catch (e) {
         if (e is UpstreamHttpException) rethrow;
-        if (kDebugMode) {
+        {
           debugPrint('[BTR] HEAD probe failed on ${BtrLog.hostOf(url)}: ${BtrLog.redact(e)}');
         }
       } finally {
@@ -1498,12 +1496,10 @@ class _SlidingWindowStreamer {
     if (pieces.isEmpty) return;
 
     if (pool.isSingleConnectionMode) {
-      if (kDebugMode) {
-        debugPrint(
-          '[BTR] 沿用单连接顺序透传模式: 节点=${BtrLog.hostOf(winningUrl)}, '
-          '区间=bytes=${pieces.first.start}-${pieces.last.end}',
-        );
-      }
+      BtrLog.log(
+        '[BTR] 沿用单连接顺序透传模式: 节点=${BtrLog.hostOf(winningUrl)}, '
+        '区间=bytes=${pieces.first.start}-${pieces.last.end}',
+      );
       _isDegraded = true;
       await _sequentialPassthrough(
         start: pieces.first.start,
@@ -1618,11 +1614,9 @@ class _SlidingWindowStreamer {
         if (_nextFlushIndex < pieces.length) {
           final remainingStart = pieces[_nextFlushIndex].start;
           final remainingEnd = pieces.last.end;
-          if (kDebugMode) {
-            debugPrint(
-              '[BTR] 并发无收益，平滑无缝切换单连接顺序透传: bytes=$remainingStart-$remainingEnd',
-            );
-          }
+          BtrLog.log(
+            '[BTR] 并发无收益，平滑无缝切换单连接顺序透传: bytes=$remainingStart-$remainingEnd',
+          );
           await _sequentialPassthrough(
             start: remainingStart,
             end: remainingEnd,
@@ -1666,13 +1660,11 @@ class _SlidingWindowStreamer {
         final cause = _failedPieces[_nextFlushIndex];
 
         pool.singleConnectionSwitchCount++;
-        if (kDebugMode) {
-          debugPrint(
-            '[BTR] 分块 #${failedPiece.index} 重试失败 (${BtrLog.redact(cause)})，'
-            '降级为对该区间 bytes=${failedPiece.start}-$remainingEnd 的单连接顺序透传'
-            '（本视频第 ${pool.singleConnectionSwitchCount} 次切单连接）',
-          );
-        }
+        BtrLog.log(
+          '[BTR] 分块 #${failedPiece.index} 重试失败 (${BtrLog.redact(cause)})，'
+          '降级为对该区间 bytes=${failedPiece.start}-$remainingEnd 的单连接顺序透传'
+          '（本视频第 ${pool.singleConnectionSwitchCount} 次切单连接）',
+        );
 
         await _sequentialPassthrough(
           start: failedPiece.start,
@@ -1963,7 +1955,7 @@ class _SlidingWindowStreamer {
         caller: 'passthrough',
       );
       try {
-        if (kDebugMode) {
+        {
           debugPrint(
             '[BTR] 降级单连接顺序透传启动 (尝试 ${attempt + 1}/$maxPassthroughRetries): '
             'url=${BtrLog.hostOf(url)}, range=bytes=$currentStart-$end'
@@ -2121,7 +2113,7 @@ class _SlidingWindowStreamer {
         if (switchedBack) {
           final nextStart = currentStart;
           if (nextStart <= end) {
-            if (kDebugMode) {
+            {
               debugPrint(
                 '[BTR] 单连接降速切回多并发: 剩余 bytes=$nextStart-$end',
               );
@@ -2151,7 +2143,7 @@ class _SlidingWindowStreamer {
         }
 
         if (currentStart > end || resp.statusCode == HttpStatus.ok) {
-          if (kDebugMode) {
+          {
             debugPrint(
               '[BTR] 降级单连接顺序透传成功完成: 传输 ${currentStart - start} 字节, '
               '区间=bytes=$start-$end',
@@ -2168,7 +2160,7 @@ class _SlidingWindowStreamer {
       } catch (e) {
         lastError = e;
         if (token.isCancelled || e is UpstreamHttpException) rethrow;
-        if (kDebugMode) {
+        {
           debugPrint('[BTR] 降级单连接顺序透传尝试 ${attempt + 1} 失败: ${BtrLog.redact(e)}');
         }
       } finally {
@@ -2177,7 +2169,7 @@ class _SlidingWindowStreamer {
       }
     }
 
-    if (kDebugMode) {
+    {
       debugPrint(
         '[BTR] 降级单连接顺序透传所有重试均失败: ${BtrLog.redact(lastError)}, 原因: 上游彻底不可用',
       );
