@@ -473,13 +473,15 @@ class CdnPool {
 
   bool get hasRacerHint => _racerHintHost != null && _racerHintHost!.isNotEmpty;
 
-  /// 竞速 hint / 粘性节点是否越过「当前服务分组」。
+  /// 竞速 hint / 粘性节点是否越过「用户手选的节点分组」。
   ///
-  /// 判定依据：用户手选分组优先（未探测完成也立即生效），其次才是起播测速定下的分组；
-  /// auto 模式且探测还没定组时不拦（`_activeGroup` 此时只是默认值，用它判定会把
-  /// auto 下竞速选出的海外节点误判成越界）。
+  /// 只按 **用户手选分组**（`preferredGroup`，对应官方「CDN 模式」）判定，**不按起播测速
+  /// 定下的分组**判定 —— 原因有真机证据：起播测速预算只有总 400ms / 单批 300ms，在单连接
+  /// 被限速的线路上 8 个候选实测全是 0.00（样本收不满），两组"平局"于是分组默认落大陆组
+  /// （真机 6 次里 5 次如此）。若用这个结果去否决竞速实测出的海外胜者，等于把竞速的收益
+  /// 整个抵消掉。auto 模式（未手选）一律不拦，让实测说话。
   bool _conflictsServedGroup(String url) {
-    final g = preferredGroup ?? (_groupDecided ? _activeGroup : null);
+    final g = preferredGroup;
     if (g == null) return false;
     final host = CdnBanList.hostOf(url);
     if (host.isEmpty) return false;
