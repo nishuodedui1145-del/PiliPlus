@@ -4,12 +4,12 @@
     <p>把 <a href="https://github.com/MrTangLuyao/Bilibili-thread-ripper">Bilibili-thread-ripper</a> 的<b>多 Range 并发下载</b>移植进 PiliPlus（Flutter 开发的 B 站第三方客户端）</p>
 </div>
 > 
-> ## ⚠️ 当前推荐版本：`v2.1.4-btr.12`
+> ## ⚠️ 当前可用版本：`v2.1.4-btr.12`
 > 
-> `btr.13` / `btr.14` 存在**起播缺陷**（开着 BTR 时视频无法起播，关闭 BTR 正常），已标记为 **pre-release**，请勿安装。
-> 修复版将以 `v2.1.4-btr.15` 发布（修：探速占用连接槽位导致播放器饿死 + 代理绝不允许卡死播放器，拿不到数据即让路）。
+> **本仓库目前只发布 `v2.1.4-btr.12` 这一个版本**（`btr.13`/`btr.14` 有起播缺陷、`btr.15` 尚未通过真机验证，均已从 Releases 下架）。
+> 修复版（探速不再抢占下载槽位 + 起播超时 302 让路 + 视频预算下限 8）将在真机验证通过后发布。
 > 
-> **安卓**：下载 `PiliPlus-BTR-2.1.4-btr.12-arm64.apk` 直接覆盖安装（同签名，无需卸载）。
+> **安卓**：下载 `PiliPlus-BTR-2.1.4-btr.12-arm64.apk`，直接覆盖安装（与本项目历史版本同一签名，无需卸载）。
 > **iOS**：`PiliPlus-BTR-ios-2.1.4-btr.12-unsigned.ipa` 为未签名包，需自行侧载。
 
 > ### ⚠️ 这是个人 fork，不是官方仓库
