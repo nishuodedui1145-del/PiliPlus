@@ -138,6 +138,36 @@ class CdnRacer {
 
   CdnRaceResult? _cached;
 
+  int _consecutiveFailures = 0;
+  int _backoffUntilMs = 0;
+
+  /// 连续未能测出/失败达到此门限触发退避（建议 N=2）
+  static const int maxConsecutiveFailures = 2;
+
+  /// 退避时长（建议 M=60s）
+  static const Duration raceBackoffDuration = Duration(seconds: 60);
+
+  /// 是否处于退避静默期
+  bool get isBackoffActive =>
+      DateTime.now().millisecondsSinceEpoch < _backoffUntilMs;
+
+  int get consecutiveFailures => _consecutiveFailures;
+
+  /// 期间有请求成功则重置退避状态
+  void resetFailureBackoff() {
+    _consecutiveFailures = 0;
+    _backoffUntilMs = 0;
+  }
+
+  void _recordFailure() {
+    _consecutiveFailures++;
+    if (_consecutiveFailures >= maxConsecutiveFailures) {
+      _backoffUntilMs = DateTime.now().millisecondsSinceEpoch +
+          raceBackoffDuration.inMilliseconds;
+      log('[BTR] 竞速退避: 连续 $_consecutiveFailures 次未能测出 → 暂停 ${raceBackoffDuration.inSeconds}s');
+    }
+  }
+
   /// 最近一次竞速整批下载的总字节数
   int lastTotalSampleBytes = 0;
 
@@ -488,6 +518,15 @@ class CdnRacer {
     Iterable<String>? bannedHosts,
     bool ignoreHysteresis = false,
   }) async {
+    if (isBackoffActive) {
+      final remainingSec = max(
+        1,
+        (_backoffUntilMs - DateTime.now().millisecondsSinceEpoch) ~/ 1000,
+      );
+      log('[BTR] 竞速退避中: 连续 $_consecutiveFailures 次未能测出，剩余 ${remainingSec}s → 跳过本轮竞速');
+      return null;
+    }
+
     final toProbe = filterCandidates(
       candidates: candidates,
       group: group,
@@ -496,6 +535,7 @@ class CdnRacer {
 
     if (toProbe.isEmpty) {
       log('[BTR] CDN 竞速: 全部失败 → 不改变现役状态');
+      _recordFailure();
       return null;
     }
 
@@ -583,8 +623,11 @@ class CdnRacer {
         '[BTR] CDN 竞速: 所有候选均未能测出速度（当前网络到 B 站节点无响应） → 不改变现役状态 '
         '候选 ${candidateSummaries.join(' ')} 用时=${batchSw.elapsedMilliseconds}ms',
       );
+      _recordFailure();
       return null;
     }
+
+    resetFailureBackoff();
 
     // 按吞吐降序选出最快候选：
     // 下界估计取 0.6 倍保守折扣参与比较，避免把慢节点抬成最优；
@@ -644,6 +687,7 @@ class CdnRacer {
   /// 重置状态与清理客户端
   void reset() {
     _cached = null;
+    resetFailureBackoff();
     _internalHttpClient?.close(force: true);
     _internalHttpClient = null;
   }

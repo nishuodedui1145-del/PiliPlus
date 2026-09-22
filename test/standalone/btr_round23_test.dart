@@ -469,12 +469,14 @@ void main() {
       expect(budget.globalLimit, equals(11));
 
       budget.updateBudget(2);
-      expect(budget.videoLimit, equals(2));
+      // 第 38 轮：视频侧预算加下限 minVideoBudget=8（真机日志实证：视频预算曾塌到 4 / 全局 7，
+      // 导致 piece#0 反复 4 秒、播放器等不到首批数据而起播失败）—— 所以这里 video 保持下限 8。
+      expect(budget.videoLimit, equals(8));
       // 音频预算固定 2 条、补救预留固定 1 条（第十一轮真机对比后拍板：官方公式会让视频可用连接变少，体感更差）
-      // —— 所以并发降到 2 时音频**不会**缩到 1，全局上限 = 2 + 2 + 1 = 5
+      // —— 所以并发降到 2 时音频**不会**缩到 1，也不受视频下限影响；全局上限 = 8 + 2 + 1 = 11
       expect(budget.audioLimit, equals(2));
       expect(budget.rescueLimit, equals(1));
-      expect(budget.globalLimit, equals(5));
+      expect(budget.globalLimit, equals(11));
     });
   });
 

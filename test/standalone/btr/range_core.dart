@@ -103,26 +103,24 @@ abstract final class RangeCore {
   /// （例如 8 × 512 KiB = 4 MiB，32 × 512 KiB = 16 MiB）
   static const int defaultMaxPieceBytes = 512 * 1024; // 512 KiB
 
+  /// 视频侧并发预算下限（建议 8，避免并发被压死无法起播）
+  static const int minVideoBudget = 8;
+
+  /// 全局并发预算上限（防止极端配置耗尽系统文件描述符）
+  static const int maxGlobalSockets = 64;
+
+  /// 探速/测速独立小预算并发上限（建议并发 <= 2，不与视频 piece 争抢）
+  static const int maxProbeConcurrency = 2;
+
   /// 计算官方并发预算分配（对齐官方 idm-downloader.js:313-318 / 387-392）：
-  /// - rescueReserve = max(1, min(8, ceil(c/8)))
-  /// - mediaBudget = max(1, c - rescueReserve)
-  /// - audioBudget = max(1, min(mediaBudget, ceil(c/8)))
-  /// - videoBudget = max(1, mediaBudget - audioBudget)
-  ///
-  /// 例：
-  /// c=4  -> 音频 1、rescue 1、视频 2（总计 4）
-  /// c=8  -> 音频 1、rescue 1、视频 6（总计 8）
-  /// c=16 -> 音频 2、rescue 2、视频 12（总计 16）
-  /// c=32 -> 音频 4、rescue 4、视频 24（总计 32）
+  /// - 视频侧预算不得低于下限（8），且受全局上限（64）约束，不再出现「视频=4 / 全局=7」
+  /// - 音频固定 2 条，补救预留 1 条
   static ({int rescueReserve, int mediaBudget, int audioBudget, int videoBudget})
       calculateBudget(int c) {
-    // ⚠️ 回退到第十一轮语义（真机对比：官方公式让视频可用连接数变少，
-    //    用户体感"速率不如之前"）：
-    //    视频拿满配置的并发上限，音频固定 2 条，补救预留 1 条。
-    final effectiveC = max(1, c);
+    final effectiveC = max(minVideoBudget, min(maxGlobalSockets, c));
     const audioBudget = 2;
     const rescueReserve = 1;
-    final videoBudget = max(1, effectiveC);
+    final videoBudget = effectiveC;
     final mediaBudget = videoBudget + rescueReserve;
     return (
       rescueReserve: rescueReserve,
@@ -345,8 +343,8 @@ abstract final class RangeCore {
   /// 启动测速候选节点数总量上限（回退到第十一轮的 4 个候选）
   static const int defaultStartupProbeCandidateCount = 4;
 
-  /// 启动测速每批最大并发路数（每批最多 4 路并发）
-  static const int defaultStartupProbeBatchConcurrency = 4;
+  /// 启动测速每批最大并发路数（对齐 maxProbeConcurrency: 最多 2 路并发，不与视频 piece 争抢）
+  static const int defaultStartupProbeBatchConcurrency = maxProbeConcurrency;
 
   /// 启动测速分块大小（64 KiB：必须在 0.5 秒预算内测得出速度，
   /// 用 256KB 样本在慢节点上会全部超时 -> 等于没测，真机 04:06 日志已确认）
@@ -386,6 +384,9 @@ abstract final class RangeCore {
 
   /// 降级直连前的宽限延迟（对齐官方 page-hook.js:1081: setTimeout(..., 3500)）
   static const int fallbackGraceMs = 3500;
+
+  /// 起播硬截止时间（对齐 fallbackGraceMs: 3500ms，超时未出数据立即 302 让路）
+  static const Duration startupHardDeadline = Duration(milliseconds: fallbackGraceMs);
 
   /// 起播阶段并发起手值公式的 ratio 分档阈值（对齐官方 native-mse-player.js:365-369）
   /// 代理层翻译：按 ratio = throughput / required 分档推导起播并发起手值

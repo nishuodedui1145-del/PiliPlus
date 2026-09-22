@@ -472,9 +472,14 @@ class BtrProxyServer {
     try {
       final account = Accounts.video.isLogin ? Accounts.video : Accounts.main;
       if (account.isLogin) {
-        final cookies = await account.cookieJar.loadForRequest(
-          Uri.parse(HttpString.baseUrl),
-        );
+        final cookies = await account.cookieJar
+            .loadForRequest(
+              Uri.parse(HttpString.baseUrl),
+            )
+            .timeout(
+              const Duration(milliseconds: 300),
+              onTimeout: () => const [],
+            );
         if (cookies.isNotEmpty) {
           return cookies.map((c) => '${c.name}=${c.value}').join('; ');
         }
@@ -556,6 +561,7 @@ class BtrProxyServer {
 
     final token = CancellationToken();
     _activeTokens.add(token);
+    final requestSw = Stopwatch()..start();
     bool bytesSent = false;
     Object? requestError;
     bool sinkClosed = false;
@@ -577,9 +583,25 @@ class BtrProxyServer {
     late final CdnPool pool;
     late final Map<String, String> headers;
     late final MultiRangeDownloader downloader;
+    final groupParam = request.uri.queryParameters['g'];
+    final group = groupParam ?? 'auto';
+    bool deferRaceToPostStartup = false;
+
+    void onFirstBytesSent() {
+      if (bytesSent) return;
+      bytesSent = true;
+      racer.resetFailureBackoff();
+      if (deferRaceToPostStartup && cdnRaceEnabled && !pool.hasRacerHint) {
+        deferRaceToPostStartup = false;
+        _triggerBackgroundRace(
+          sampleUrl: targetUrl,
+          group: group,
+          pool: pool,
+        );
+      }
+    }
+
     try {
-      final groupParam = request.uri.queryParameters['g'];
-      final group = groupParam ?? 'auto';
       if (kind == 'video') {
         lastSampleUrl = targetUrl;
         lastGroup = group;
@@ -620,12 +642,9 @@ class BtrProxyServer {
               '${cached.isEstimated ? " (hint折后=${(cached.hintBytesPerSec / 1048576).toStringAsFixed(2)} MB/s)" : ""}',
             );
           } else {
-            // 缓存过期或首次竞速：后台跑竞速（绝不阻塞当前播放）
-            _triggerBackgroundRace(
-              sampleUrl: targetUrl,
-              group: group,
-              pool: pool,
-            );
+            // 起播窗口内禁止竞速：从收到播放请求到首批数据写出之间不发起源速/测速，推迟到起播完成之后
+            BtrLog.log('[BTR] 起播窗口内跳过竞速');
+            deferRaceToPostStartup = true;
           }
         }
       }
@@ -669,7 +688,7 @@ class BtrProxyServer {
             targetUrl: targetUrl,
             token: token,
             defaultHeaders: headers,
-            onByteSent: () => bytesSent = true,
+            onByteSent: onFirstBytesSent,
             onSinkError: () => sinkErrored = true,
             pool: pool,
             downloader: downloader,
@@ -720,7 +739,7 @@ class BtrProxyServer {
           targetUrl: targetUrl,
           token: token,
           defaultHeaders: headers,
-          onByteSent: () => bytesSent = true,
+          onByteSent: onFirstBytesSent,
           onSinkError: () => sinkErrored = true,
           pool: pool,
           downloader: downloader,
@@ -741,7 +760,7 @@ class BtrProxyServer {
           targetUrl: targetUrl,
           token: token,
           defaultHeaders: headers,
-          onByteSent: () => bytesSent = true,
+          onByteSent: onFirstBytesSent,
           onSinkError: () => sinkErrored = true,
           pool: pool,
           downloader: downloader,
@@ -850,27 +869,50 @@ class BtrProxyServer {
       // 所以给它一个硬上限：超时就**先把响应头发出去**，再用纯数据透传补数据；
       // 只有拿到明确的上游错误状态（HttpException 等）才如实上报。
       StartupProbeResult? probeMaybe;
+      final probeToken = CancellationToken();
+      void onParentCancel() => probeToken.cancel(token.reason);
+      token.addListener(onParentCancel);
       try {
         probeMaybe = await downloader
             .probeHead(
               start: start,
               end: requestedEnd,
               pool: pool,
-              token: token,
+              token: probeToken,
             )
             .timeout(RangeCore.firstResponseDeadline);
       } catch (e) {
         probeMaybe = null;
+      } finally {
+        token.removeListener(onParentCancel);
+        if (probeMaybe == null) {
+          probeToken.cancel('启动测速超时或未命中');
+        }
       }
 
       if (probeMaybe == null) {
         // 首响应超时，判定加速不可行，记录降级直连状态（对齐官方 page-hook.js:1074-1081 / 140-158）
         pool.markDirectFallback('首响应超时');
 
-        // ⚠️ Dart HttpServer 的响应头**只有在写入至少 1 字节 body 时才会真正发出**
-        // （PC 实测：只 flush() / bufferOutput=false + add(空) 都一个字节也发不出去）。
-        // 所以这里用一个「1 字节 Range」把响应头顶出去：1 字节请求几乎只受 RTT 影响，
-        // 慢节点也能在几百毫秒内返回；随后再继续补流。
+        // 计算距离起播硬截止（3500ms）剩余可用时间
+        final elapsed = requestSw.elapsedMilliseconds;
+        final remainingMs = RangeCore.fallbackGraceMs - elapsed;
+
+        // 若剩余时间不足以完成顶头，立即让路 302 重定向到直链
+        if (remainingMs <= 300) {
+          final waitMs = requestSw.elapsedMilliseconds;
+          BtrLog.log('[BTR] 起播让路: 等待 ${waitMs}ms 无可用数据 → 302 直链');
+          if (!sinkClosed &&
+              !sinkErrored &&
+              _terminatedResponses[request.response] != true) {
+            request.response.statusCode = HttpStatus.found;
+            request.response.headers.set(HttpHeaders.locationHeader, targetUrl);
+            await request.response.close();
+          }
+          return;
+        }
+
+        // 尝试用 1 字节顶出响应头（受起播硬截止剩余时间约束）
         ({Uint8List bytes, int? total}) primer = (bytes: Uint8List(0), total: null);
         try {
           primer = await _fetchPrimerByte(
@@ -879,14 +921,12 @@ class BtrProxyServer {
             defaultHeaders: headers,
             token: token,
             pool: pool,
+            timeout: Duration(milliseconds: min(remainingMs, 1500)),
           );
         } catch (e) {
           BtrLog.log('[BTR] 顶头首字节异常兜底: ${BtrLog.redact(e)}');
         }
         final primerBytes = primer.bytes;
-        // 顶头响应里带 Content-Range: bytes N-N/总长度 —— 顺手把总长度拿回来。
-        // 有总长度就能回**精确的 206**，播放器才不会因为"不知道文件多大"而 seek 失败
-        // （真机 14:50 出现 Seek failed (to 3490, size -38) 的循环，就是因为 200 无长度）。
         final resolvedTotal = primer.total ??
             totalLength ??
             _totalLengthCache[targetUrl] ??
@@ -896,8 +936,8 @@ class BtrProxyServer {
         }
         final nextOffset = start + primerBytes.length;
 
-        if (resolvedTotal != null && resolvedTotal > 0) {
-          // ── 知道总长度：回 206 + Content-Range + Content-Length（保住 seek）──
+        // 保持已被验证的正确行为：成功获取 1 字节且已知总长度时，用 1 字节顶出响应头（206 精确区间）
+        if (primerBytes.isNotEmpty && resolvedTotal != null && resolvedTotal > 0) {
           final end = (requestedEnd ?? (resolvedTotal - 1)).clamp(
             start,
             resolvedTotal - 1,
@@ -916,14 +956,13 @@ class BtrProxyServer {
             HttpHeaders.contentLengthHeader,
             '${end - start + 1}',
           );
-          if (primerBytes.isNotEmpty &&
-              !sinkErrored &&
+          if (!sinkErrored &&
               !sinkClosed &&
               _terminatedResponses[request.response] != true) {
             try {
               request.response.add(primerBytes);
               await request.response.flush();
-              bytesSent = true;
+              onFirstBytesSent();
             } catch (e) {
               sinkErrored = true;
               BtrLog.log(
@@ -944,7 +983,7 @@ class BtrProxyServer {
             defaultHeaders: headers,
             fromOffset: nextOffset,
             endOffset: end,
-            onByteSent: () => bytesSent = true,
+            onByteSent: onFirstBytesSent,
             onSinkError: () => sinkErrored = true,
             downloader: downloader,
             pool: pool,
@@ -952,48 +991,17 @@ class BtrProxyServer {
           return; // 外层 finally 统一关闭
         }
 
-        // ── 拿不到总长度：只能退化成 200（此时播放器的 seek 会受限）──
-        request.response.statusCode = HttpStatus.ok;
-        request.response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
-        request.response.headers.set(
-          HttpHeaders.contentTypeHeader,
-          'video/mp4',
-        );
-        if (primerBytes.isNotEmpty &&
+        // ⚠️ 绝不出现「用 0 字节顶出、总长度未知、退化为 200」！
+        // 拿不到有效 1 字节或总长度未知时，立即执行起播让路：302 重定向到上游直链（退回"能看"状态）
+        final waitMs = requestSw.elapsedMilliseconds;
+        BtrLog.log('[BTR] 起播让路: 等待 ${waitMs}ms 无可用数据 → 302 直链');
+        if (!sinkClosed &&
             !sinkErrored &&
-            !sinkClosed &&
             _terminatedResponses[request.response] != true) {
-          try {
-            request.response.add(primerBytes);
-            await request.response.flush();
-            bytesSent = true;
-          } catch (e) {
-            sinkErrored = true;
-            BtrLog.log(
-              '[BTR] 下游写入冲突(已防御): 场景=顶头首字节(200)写入抛错: ${BtrLog.redact(e)}',
-            );
-            rethrow;
-          }
+          request.response.statusCode = HttpStatus.found;
+          request.response.headers.set(HttpHeaders.locationHeader, targetUrl);
+          await request.response.close();
         }
-        BtrLog.log(
-          '[BTR] 首响应超时后退化为 200: 原因=上游顶头探测未返回 Content-Range 且无历史总长度缓存 (resolvedTotal=null), '
-          '用 ${primerBytes.length} 字节顶出响应头: 节点=${BtrLog.hostOf(targetUrl)}',
-        );
-        BtrLog.log(
-          '[BTR] 顶头续流: start=$start 已写=${primerBytes.length} 续流起点=$nextOffset '
-          '来源=${BtrLog.hostOf(targetUrl)}',
-        );
-        await _streamDirect(
-          clientRequest: request,
-          targetUrl: targetUrl,
-          token: token,
-          defaultHeaders: headers,
-          fromOffset: nextOffset,
-          onByteSent: () => bytesSent = true,
-          onSinkError: () => sinkErrored = true,
-          downloader: downloader,
-          pool: pool,
-        );
         return; // 外层 finally 统一关闭
       }
       final StartupProbeResult probe = probeMaybe;
@@ -1092,7 +1100,7 @@ class BtrProxyServer {
         try {
           request.response.add(probe.headBytes);
           await request.response.flush();
-          bytesSent = true;
+          onFirstBytesSent();
         } catch (e) {
           sinkErrored = true;
           BtrLog.log(
@@ -1174,7 +1182,7 @@ class BtrProxyServer {
               try {
                 request.response.add(chunk);
                 await request.response.flush();
-                bytesSent = true;
+                onFirstBytesSent();
               } catch (e) {
                 sinkErrored = true;
                 BtrLog.log(
@@ -1211,7 +1219,7 @@ class BtrProxyServer {
             targetUrl: targetUrl,
             token: token,
             defaultHeaders: headers,
-            onByteSent: () => bytesSent = true,
+            onByteSent: onFirstBytesSent,
             onSinkError: () => sinkErrored = true,
             pool: pool,
             downloader: downloader,
@@ -1219,6 +1227,19 @@ class BtrProxyServer {
         } catch (pe) {
           requestError = pe;
           token.cancel(pe);
+          if (!bytesSent &&
+              !sinkClosed &&
+              !sinkErrored &&
+              _terminatedResponses[request.response] != true) {
+            final waitMs = requestSw.elapsedMilliseconds;
+            BtrLog.log('[BTR] 起播让路: 等待 ${waitMs}ms 不支持Range直连失败 → 302 直链');
+            try {
+              request.response.statusCode = HttpStatus.found;
+              request.response.headers.set(HttpHeaders.locationHeader, targetUrl);
+              await request.response.close();
+              return;
+            } catch (_) {}
+          }
           if (!bytesSent) {
             final statusCode = _extractStatusCode(pe);
             try {
@@ -1231,6 +1252,19 @@ class BtrProxyServer {
       requestError = e;
       token.cancel(e);
       BtrLog.log('BtrProxyServer request error: ${BtrLog.redact(e)}');
+      if (!bytesSent &&
+          !sinkClosed &&
+          !sinkErrored &&
+          _terminatedResponses[request.response] != true) {
+        final waitMs = requestSw.elapsedMilliseconds;
+        BtrLog.log('[BTR] 起播让路: 等待 ${waitMs}ms 异常(${BtrLog.redact(e)}) → 302 直链');
+        try {
+          request.response.statusCode = HttpStatus.found;
+          request.response.headers.set(HttpHeaders.locationHeader, targetUrl);
+          await request.response.close();
+          return;
+        } catch (_) {}
+      }
       if (!bytesSent) {
         final statusCode = _extractStatusCode(e);
         try {
@@ -1261,6 +1295,10 @@ class BtrProxyServer {
     required CdnPool pool,
   }) {
     if (_inFlightRace != null) return;
+    if (racer.isBackoffActive) {
+      BtrLog.log('[BTR] 竞速退避中: 跳过发起后台竞速');
+      return;
+    }
     final candidates = cdnCandidates.isNotEmpty
         ? cdnCandidates
         : (group == 'overseas' ? CdnPool.overseasHosts : CdnPool.mainlandHosts);
@@ -1487,7 +1525,9 @@ class BtrProxyServer {
   }) async {
     token.throwIfCancelled();
     final release = downloader != null
-        ? await downloader.acquireSocket(token, priority: 150, caller: 'proxy_passthrough')
+        ? await downloader
+            .acquireSocket(token, priority: 150, caller: 'proxy_passthrough')
+            .timeout(const Duration(milliseconds: 2000), onTimeout: () => () {})
         : null;
     HttpClientRequest? currentReq;
     void onCancel() {
@@ -1500,7 +1540,9 @@ class BtrProxyServer {
       token.addListener(onCancel);
       final uri = Uri.parse(targetUrl);
       final client = _getOrCreateHttpClient();
-      final upstreamReq = await client.openUrl(clientRequest.method, uri);
+      final upstreamReq = await client
+          .openUrl(clientRequest.method, uri)
+          .timeout(const Duration(milliseconds: 2500));
       currentReq = upstreamReq;
       defaultHeaders.forEach((k, v) {
         upstreamReq.headers.set(k, v);
@@ -1592,6 +1634,7 @@ class BtrProxyServer {
     required Map<String, String> defaultHeaders,
     required CancellationToken token,
     CdnPool? pool,
+    Duration timeout = RangeCore.primerFetchTimeout,
   }) async {
     token.throwIfCancelled();
     HttpClientRequest? req;
@@ -1613,7 +1656,7 @@ class BtrProxyServer {
     try {
       token..addListener(onCancel)..throwIfCancelled();
       final client = _getOrCreateHttpClient();
-      req = await client.openUrl('GET', Uri.parse(targetUrl));
+      req = await client.openUrl('GET', Uri.parse(targetUrl)).timeout(timeout);
       if (token.isCancelled) {
         req.abort();
         token.throwIfCancelled();
@@ -1622,7 +1665,7 @@ class BtrProxyServer {
         req!.headers.set(k, v);
       });
       req.headers.set(HttpHeaders.rangeHeader, 'bytes=$start-$start');
-      final resp = await req.close().timeout(RangeCore.primerFetchTimeout);
+      final resp = await req.close().timeout(timeout);
       if (token.isCancelled) {
         req.abort();
         token.throwIfCancelled();
@@ -1660,7 +1703,7 @@ class BtrProxyServer {
         },
         cancelOnError: true,
       );
-      return await completer.future.timeout(RangeCore.primerFetchTimeout);
+      return await completer.future.timeout(timeout);
     } catch (e) {
       BtrLog.log('[BTR] 顶头首字节获取失败/超时 (${BtrLog.redact(e)})，降级为空字节');
       return (bytes: Uint8List(0), total: null);
@@ -1694,7 +1737,9 @@ class BtrProxyServer {
   }) async {
     token.throwIfCancelled();
     final release = downloader != null
-        ? await downloader.acquireSocket(token, priority: 150, caller: 'stream_direct')
+        ? await downloader
+            .acquireSocket(token, priority: 150, caller: 'stream_direct')
+            .timeout(const Duration(milliseconds: 2000), onTimeout: () => () {})
         : null;
     HttpClientRequest? currentReq;
     void onCancel() {
@@ -1719,7 +1764,9 @@ class BtrProxyServer {
           ? (effectiveEnd - fromOffset + 1)
           : (effectiveEnd != null ? (effectiveEnd - effectiveBase + 1) : null);
 
-      final upstreamReq = await client.openUrl(clientRequest.method, uri);
+      final upstreamReq = await client
+          .openUrl(clientRequest.method, uri)
+          .timeout(const Duration(milliseconds: 2500));
       currentReq = upstreamReq;
       defaultHeaders.forEach((k, v) {
         upstreamReq.headers.set(k, v);

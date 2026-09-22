@@ -255,6 +255,8 @@ class StartupProbeResult {
 class MultiRangeDownloader {
   final HttpClient _httpClient;
   final PrioritySemaphore _semaphore;
+  final PrioritySemaphore _probeSemaphore =
+      PrioritySemaphore(RangeCore.maxProbeConcurrency);
   Map<String, String> defaultHeaders;
   int _concurrency;
   int _maxInFlightSockets;
@@ -262,14 +264,19 @@ class MultiRangeDownloader {
   int get concurrency => _concurrency;
   int get maxInFlightSockets => _maxInFlightSockets;
   int get activeInFlightSockets => _semaphore.activeCount;
+  int get activeProbeSockets => _probeSemaphore.activeCount;
 
-  /// 为降级、重试或外部路径申请 socket 预算槽位（必须计入全局在途预算）
+  /// 为降级、重试或外部路径申请 socket 预算槽位（探速使用独立小预算 <= 2，不与视频 piece 争抢）
   Future<void Function()> acquireSocket(
     CancellationToken? token, {
     int priority = 0,
     String? caller,
-  }) =>
-      _semaphore.acquire(token, priority: priority, caller: caller);
+  }) {
+    if (caller != null && caller.startsWith('probe')) {
+      return _probeSemaphore.acquire(token, priority: priority, caller: caller);
+    }
+    return _semaphore.acquire(token, priority: priority, caller: caller);
+  }
 
   MultiRangeDownloader({
     int concurrency = RangeCore.defaultConcurrency,
@@ -298,11 +305,13 @@ class MultiRangeDownloader {
   /// 广播取消下载器内所有排队任务
   void cancelAll([Object? reason]) {
     _semaphore.cancelAll(reason);
+    _probeSemaphore.cancelAll(reason);
   }
 
   /// 归零调度器状态与信号量
   void reset() {
     _semaphore.reset();
+    _probeSemaphore.reset();
   }
 
   /// 单次 piece 下载尝试（包含独立首字节超时 5.5s、停滞 4s、总计 15s）
@@ -312,13 +321,21 @@ class MultiRangeDownloader {
     required CancellationToken token,
     required CdnPool pool,
     int priority = 0,
+    bool isProbe = false,
     void Function()? onFirstByteReceived,
   }) async {
     token.throwIfCancelled();
-    final release = await _semaphore.acquire(
+    final effectiveIsProbe = isProbe || priority >= 200;
+    // 探速/测速使用独立小预算 (_probeSemaphore <= 2)，不与视频 piece 争抢；
+    // 槽位紧张时 piece 永远优先
+    final targetSemaphore = effectiveIsProbe ? _probeSemaphore : _semaphore;
+    final callerTag = effectiveIsProbe
+        ? 'probe'
+        : (priority >= 25 ? 'hedge' : 'piece');
+    final release = await targetSemaphore.acquire(
       token,
       priority: priority,
-      caller: priority >= 200 ? 'probe' : (priority >= 25 ? 'hedge' : 'piece'),
+      caller: callerTag,
     );
 
     final innerToken = CancellationToken();
@@ -1294,12 +1311,27 @@ class MultiRangeDownloader {
             return;
           }
 
+          // 槽位紧张时 piece 永远优先，probe 让位（跳过本轮）
+          if (_semaphore.activeCount >= _semaphore.limit || _semaphore.queueLength > 0) {
+            BtrLog.rateLimitedLog(
+              'probe_yield_tight',
+              '[BTR] 槽位紧张: 在途=${_semaphore.activeCount}/${_semaphore.limit} 队列=${_semaphore.queueLength} → 测速让位跳过本轮',
+            );
+            activeInBatch--;
+            if (activeInBatch <= 0 && !batchCompleter.isCompleted) {
+              batchTimer.cancel();
+              batchCompleter.complete();
+            }
+            return;
+          }
+
           attempt(
             piece: headPiece,
             url: url,
             token: childToken,
             pool: pool,
             priority: 200,
+            isProbe: true,
           ).then((res) {
             batchToken.removeListener(onBatchCancel);
             if (res.bytes.isEmpty || res.bps <= 0.0) {
