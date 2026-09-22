@@ -613,12 +613,13 @@ class BtrProxyServer {
                 (DateTime.now().millisecondsSinceEpoch - cached.measuredAtMs) ~/
                     1000;
             BtrLog.log(
-              '[BTR] CDN 竞速: 复用缓存（测于 $ageSec 秒前）最优=${cached.host}',
+              '[BTR] CDN 竞速: 复用缓存（测于 $ageSec 秒前）最优=${cached.host}${cached.isEstimated ? " (估算)" : ""}',
             );
-            pool.applyRacerHint(cached.host, cached.bytesPerSec);
+            pool.applyRacerHint(cached.host, cached.hintBytesPerSec);
             BtrLog.log(
               '[BTR] CDN 竞速: 最优已应用于候选池 host=${cached.host} '
-              '估计=${(cached.bytesPerSec / 1048576).toStringAsFixed(2)} MB/s',
+              '${cached.isEstimated ? "估算" : "实测"}=${(cached.bytesPerSec / 1048576).toStringAsFixed(2)} MB/s'
+              '${cached.isEstimated ? " (hint折后=${(cached.hintBytesPerSec / 1048576).toStringAsFixed(2)} MB/s)" : ""}',
             );
           } else {
             // 缓存过期或首次竞速：后台跑竞速（绝不阻塞当前播放）
@@ -1286,10 +1287,11 @@ class BtrProxyServer {
           return;
         }
         if (result != null) {
-          pool.applyRacerHint(result.host, result.bytesPerSec);
+          pool.applyRacerHint(result.host, result.hintBytesPerSec);
           BtrLog.log(
             '[BTR] CDN 竞速: 最优已应用于候选池 host=${result.host} '
-            '估计=${(result.bytesPerSec / 1048576).toStringAsFixed(2)} MB/s',
+            '${result.isEstimated ? "估算" : "实测"}=${(result.bytesPerSec / 1048576).toStringAsFixed(2)} MB/s'
+            '${result.isEstimated ? " (hint折后=${(result.hintBytesPerSec / 1048576).toStringAsFixed(2)} MB/s)" : ""}',
           );
         }
       } catch (e) {
@@ -1439,11 +1441,12 @@ class BtrProxyServer {
       );
       if (res != null) {
         for (final pool in _cdnPoolCache.values) {
-          pool.applyRacerHint(res.host, res.bytesPerSec);
+          pool.applyRacerHint(res.host, res.hintBytesPerSec);
         }
         BtrLog.log(
           '[BTR] CDN 竞速: 最优已应用于候选池 host=${res.host} '
-          '估计=${(res.bytesPerSec / 1048576).toStringAsFixed(2)} MB/s',
+          '${res.isEstimated ? "估算" : "实测"}=${(res.bytesPerSec / 1048576).toStringAsFixed(2)} MB/s'
+          '${res.isEstimated ? " (hint折后=${(res.hintBytesPerSec / 1048576).toStringAsFixed(2)} MB/s)" : ""}',
         );
         return CdnRaceReraceResult.ok(res);
       }

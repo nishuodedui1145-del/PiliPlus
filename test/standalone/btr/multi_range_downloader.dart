@@ -1303,11 +1303,7 @@ class MultiRangeDownloader {
           ).then((res) {
             batchToken.removeListener(onBatchCancel);
             if (res.bytes.isEmpty || res.bps <= 0.0) {
-              // 判定：测速拿到 0 字节 -> 加入不可用集合
-              pool
-                ..markUnusable(url)
-                ..failure(url, Exception('测速拿到 0 字节'),
-                    receivedBytes: res.bytes.length, isAbort: false);
+              // 判定：测速未测出，不盲目标记不可用（探速失败 ≠ 节点不可用）
               results[url] = 0.0;
             } else {
               results[url] = res.bps;
@@ -1345,9 +1341,8 @@ class MultiRangeDownloader {
             if (batchTimedOut && childToken.isCancelled) {
               // 因整体/批次超时被放弃的批次：视为未知，不加入不可用集合，不阻塞起播
             } else {
-              // 判定：测速超时或返回错误 -> 加入不可用集合
-              pool.markUnusable(url);
-              if (err is! RangeNotSupportedException) {
+              // 判定：测速超时或返回错误 -> 探速失败 ≠ 节点不可用，不盲目标记不可用
+              if (err is! RangeNotSupportedException && err is! TimeoutException) {
                 pool.failure(url, err, isAbort: false);
               }
             }
@@ -1448,10 +1443,16 @@ class MultiRangeDownloader {
     // 格式化打印测速日志（候选测速结果汇总与优选组）
     final summary = <String>[];
     for (final u in triedCandidates) {
-      final bps = results[u] ?? pool.getSpeed(u) ?? 0.0;
-      final mbps = (bps / (1024 * 1024)).toStringAsFixed(2);
+      final bps = results[u] ?? 0.0;
       final isDead = pool.isDead(u);
-      summary.add('${BtrLog.shortNodeName(u)}=$mbps${isDead ? '(dead)' : ''}');
+      final String speedText;
+      if (bps > 0) {
+        final mbps = (bps / (1024 * 1024)).toStringAsFixed(2);
+        speedText = mbps;
+      } else {
+        speedText = '0.00(未能测出)';
+      }
+      summary.add('${BtrLog.shortNodeName(u)}=$speedText${isDead ? '(dead)' : ''}');
     }
     BtrLog.rateLimitedLog(
       'speed_test',

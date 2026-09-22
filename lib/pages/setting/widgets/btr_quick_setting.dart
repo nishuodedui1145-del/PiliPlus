@@ -179,8 +179,10 @@ class _BtrQuickSettingSheetState extends State<BtrQuickSettingSheet> {
                       final ageStr = ageSec < 60
                           ? '$ageSec 秒前'
                           : '${(ageSec / 60).round()} 分钟前';
+                      final isEst = cached.isEstimated;
+                      final speedLabel = isEst ? '估算速度' : '实测速度';
                       final speedStr =
-                          '${(cached.bytesPerSec / (1024 * 1024)).toStringAsFixed(2)} MB/s';
+                          '${(cached.bytesPerSec / (1024 * 1024)).toStringAsFixed(2)} MB/s${isEst ? " (估算)" : ""}';
                       return Container(
                         width: double.infinity,
                         padding: const EdgeInsets.all(10),
@@ -200,7 +202,7 @@ class _BtrQuickSettingSheetState extends State<BtrQuickSettingSheet> {
                             ),
                             const SizedBox(height: 4),
                             Text(
-                              '实测速度: $speedStr · 测于 $ageStr',
+                              '$speedLabel: $speedStr · 测于 $ageStr',
                               style: theme.textTheme.bodySmall?.copyWith(
                                 color: theme.colorScheme.outline,
                               ),
@@ -233,16 +235,25 @@ class _BtrQuickSettingSheetState extends State<BtrQuickSettingSheet> {
                                   switch (reraceRes.outcome) {
                                     case CdnRaceOutcome.ok:
                                       final res = reraceRes.result!;
-                                      SmartDialog.showToast(
-                                        '竞速完成: 最优=${res.host} (${(res.bytesPerSec / 1048576).toStringAsFixed(2)} MB/s)',
-                                      );
+                                      final speedMb =
+                                          (res.bytesPerSec / 1048576)
+                                              .toStringAsFixed(2);
+                                      if (res.isEstimated) {
+                                        SmartDialog.showToast(
+                                          '竞速完成: 估算最优=${res.host} (~$speedMb MB/s 估算)',
+                                        );
+                                      } else {
+                                        SmartDialog.showToast(
+                                          '竞速完成: 最优=${res.host} ($speedMb MB/s)',
+                                        );
+                                      }
                                     case CdnRaceOutcome.noSample:
                                       SmartDialog.showToast(
                                         '还没有走代理的播放样本：请先重新进入视频（或切画质）让 BTR 生效后再试',
                                       );
                                     case CdnRaceOutcome.noWinner:
                                       SmartDialog.showToast(
-                                        '竞速完成：候选节点全部超时/失败，未改变现役节点',
+                                        '竞速完成：所有候选均未能测出速度（当前网络到 B 站节点无响应），已保持现役节点',
                                       );
                                     case CdnRaceOutcome.failed:
                                       SmartDialog.showToast(

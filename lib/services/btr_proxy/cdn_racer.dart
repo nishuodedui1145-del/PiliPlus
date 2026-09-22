@@ -21,17 +21,50 @@ class CdnRaceResult {
   /// 节点分组 ('mainland' | 'overseas' | 'auto')
   final String group;
 
+  /// 是否为下界估计值（未收满但收到可观样本，或小样本降级）
+  final bool isEstimated;
+
   const CdnRaceResult({
     required this.host,
     required this.bytesPerSec,
     required this.measuredAtMs,
     required this.candidateCount,
     required this.group,
+    this.isEstimated = false,
   });
+
+  /// 用于竞速 hint 时的保守吞吐（下界估计取 0.6 倍折扣，收满实测取原值）
+  double get hintBytesPerSec =>
+      isEstimated ? bytesPerSec * 0.6 : bytesPerSec;
 
   @override
   String toString() =>
-      'CdnRaceResult(host: $host, speed: ${(bytesPerSec / (1024 * 1024)).toStringAsFixed(2)} MB/s, group: $group)';
+      'CdnRaceResult(host: $host, speed: ${(bytesPerSec / (1024 * 1024)).toStringAsFixed(2)} MB/s${isEstimated ? " (估算)" : ""}, group: $group)';
+}
+
+/// 单个候选节点的探测结果状态
+class CdnCandidateProbeResult {
+  final String host;
+  final double bps;
+  final int bytes;
+  final bool isEstimated;
+  final bool isUnmeasured;
+
+  const CdnCandidateProbeResult({
+    required this.host,
+    required this.bps,
+    required this.bytes,
+    this.isEstimated = false,
+    this.isUnmeasured = false,
+  });
+
+  const CdnCandidateProbeResult.unmeasured(this.host)
+      : bps = 0.0,
+        bytes = 0,
+        isEstimated = false,
+        isUnmeasured = true;
+
+  bool get isSuccessful => !isUnmeasured && bps > 0;
 }
 
 /// 手动重新竞速结果状态
@@ -259,13 +292,120 @@ class CdnRacer {
     return groupFiltered.take(maxCandidates).toList();
   }
 
-  /// 探测单节点吞吐（Range 0..probeBytes-1），测首字节到收满的速率
-  Future<({double bps, int bytes})?> _probeSingleCandidate({
+  /// 最小有效部分样本门限（16 KiB）：未收满但达到此门限记为下界估计
+  static const int minPartialSampleBytes = 16 * 1024;
+
+  /// 自适应降级更小探测样本（16 KiB）
+  static const int smallProbeBytes = 16 * 1024;
+
+  /// 提取用于测速简报的短节点名（如 upos-sz-mirrorcosov -> cosov）
+  static String shortNodeName(String host) {
+    try {
+      final h = host.contains(':') ? host.split(':').first : host;
+      final match = RegExp(r'mirror([a-zA-Z0-9_-]+)').firstMatch(h);
+      if (match != null) return match.group(1)!;
+      final parts = h.split('.');
+      return parts.isNotEmpty ? parts.first : h;
+    } catch (_) {
+      return host;
+    }
+  }
+
+  /// 执行单个区间的 Range 探测：
+  /// - 收到首字节后才启动计时（排除建连与 TTFB 延迟对速度的稀释）
+  /// - 支持读取超时与整体超时拦截
+  Future<({double bps, int bytes, bool isFull})?> _probeRange({
+    required Uri probeUri,
+    required HttpClient client,
+    required int targetBytes,
+    required Duration timeout,
+  }) async {
+    if (timeout.inMilliseconds <= 50) return null;
+    final probeSw = Stopwatch()..start();
+    HttpClientRequest? req;
+    try {
+      req = await client.openUrl('GET', probeUri).timeout(timeout);
+      req.headers.set(HttpHeaders.rangeHeader, 'bytes=0-${targetBytes - 1}');
+      req.headers.set(
+        HttpHeaders.userAgentHeader,
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      );
+      req.headers.set(HttpHeaders.refererHeader, 'https://www.bilibili.com/');
+      req.headers.set(HttpHeaders.acceptHeader, '*/*');
+
+      final remainingAfterOpen = timeout - probeSw.elapsed;
+      if (remainingAfterOpen <= Duration.zero) return null;
+
+      final resp = await req.close().timeout(remainingAfterOpen);
+      if (resp.statusCode != HttpStatus.ok &&
+          resp.statusCode != HttpStatus.partialContent) {
+        await resp
+            .drain<void>()
+            .timeout(const Duration(milliseconds: 100), onTimeout: () {});
+        return null;
+      }
+
+      int receivedBytes = 0;
+      final transferSw = Stopwatch();
+      bool firstByteReceived = false;
+
+      final remainingAfterHeaders = timeout - probeSw.elapsed;
+      if (remainingAfterHeaders <= Duration.zero) return null;
+
+      try {
+        await for (final chunk in resp.timeout(remainingAfterHeaders)) {
+          if (!firstByteReceived) {
+            firstByteReceived = true;
+            transferSw.start(); // 收到首字节后开始计时！
+          }
+          receivedBytes += chunk.length;
+          if (receivedBytes >= targetBytes || probeSw.elapsed >= timeout) {
+            break;
+          }
+        }
+      } catch (_) {
+        // 读取超时或中断：保留已接收到的有效字节与首字节以来的计时
+      } finally {
+        transferSw.stop();
+        try {
+          req.abort();
+        } catch (_) {}
+      }
+
+      if (!firstByteReceived || receivedBytes <= 0) {
+        return null;
+      }
+
+      final elapsedUs = max(100, transferSw.elapsedMicroseconds);
+      final sec = elapsedUs / 1000000.0;
+      final bps = receivedBytes / sec;
+      final isFull = receivedBytes >= (targetBytes * 0.95).floor();
+
+      return (bps: bps, bytes: receivedBytes, isFull: isFull);
+    } catch (_) {
+      return null;
+    } finally {
+      probeSw.stop();
+      try {
+        req?.abort();
+      } catch (_) {}
+    }
+  }
+
+  /// 探测单节点吞吐：
+  /// 1. 先尝试 64KB 标准探测，收到首字节后开始计时；
+  ///    - 收满（>= 95%）记为 measured 实测；
+  ///    - 未收满但 >= 16KB 记为下界估计（isEstimated = true）；
+  /// 2. 64KB 探测失败，自适应退一步尝试 16KB 重试一次；
+  ///    - 重试收满记为下界估计；
+  ///    - 仍失败则判定为「未能测出」（区别于速度为 0）。
+  Future<CdnCandidateProbeResult> _probeSingleCandidate({
     required String host,
     required String sampleUrl,
     required HttpClient client,
     required Duration deadline,
   }) async {
+    final candidateSw = Stopwatch()..start();
     try {
       final sampleUri = Uri.parse(sampleUrl);
       String targetHost = host;
@@ -280,47 +420,63 @@ class CdnRacer {
         port: targetPort ?? (sampleUri.hasPort ? sampleUri.port : null),
       );
 
-      final req = await client.openUrl('GET', probeUri).timeout(deadline);
-      req.headers.set(HttpHeaders.rangeHeader, 'bytes=0-${probeBytes - 1}');
-      req.headers.set(
-        HttpHeaders.userAgentHeader,
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      // 第 1 步：尝试 64KB 标准探测
+      final firstRes = await _probeRange(
+        probeUri: probeUri,
+        client: client,
+        targetBytes: probeBytes,
+        timeout: deadline,
       );
-      req.headers.set(HttpHeaders.refererHeader, 'https://www.bilibili.com/');
-      req.headers.set(HttpHeaders.acceptHeader, '*/*');
 
-      final resp = await req.close().timeout(deadline);
-      if (resp.statusCode != HttpStatus.ok &&
-          resp.statusCode != HttpStatus.partialContent) {
-        await resp
-            .drain<void>()
-            .timeout(const Duration(milliseconds: 100), onTimeout: () {});
-        return null;
-      }
-
-      int receivedBytes = 0;
-      final sw = Stopwatch()..start();
-      await for (final chunk in resp.timeout(deadline)) {
-        receivedBytes += chunk.length;
-        if (receivedBytes >= probeBytes) {
-          break;
+      if (firstRes != null) {
+        if (firstRes.isFull) {
+          // 收满（>=95%）：标记为 measured 实测
+          return CdnCandidateProbeResult(
+            host: host,
+            bps: firstRes.bps,
+            bytes: firstRes.bytes,
+            isEstimated: false,
+          );
+        } else if (firstRes.bytes >= minPartialSampleBytes) {
+          // 未收满但收到可观样本（>=16KB）：记为下界估计
+          return CdnCandidateProbeResult(
+            host: host,
+            bps: firstRes.bps,
+            bytes: firstRes.bytes,
+            isEstimated: true,
+          );
         }
       }
-      sw.stop();
 
-      // 只有收满（或至少 >= probeBytes * 0.95）才算有效样本；未收满直接判为失败返回 null
-      final minValidBytes = (probeBytes * 0.95).floor();
-      if (receivedBytes < minValidBytes) {
-        return null;
+      // 第 2 步：64KB 探测失败，自适应退一步尝试 16KB 重试一次
+      final elapsedMs = candidateSw.elapsedMilliseconds;
+      final remainingMs = deadline.inMilliseconds - elapsedMs;
+      if (remainingMs >= 80) {
+        final retryRes = await _probeRange(
+          probeUri: probeUri,
+          client: client,
+          targetBytes: smallProbeBytes,
+          timeout: Duration(milliseconds: remainingMs),
+        );
+
+        if (retryRes != null &&
+            retryRes.bytes >= (smallProbeBytes * 0.95).floor()) {
+          // 小样本重试收满：记为下界估计（小样本保守化）
+          return CdnCandidateProbeResult(
+            host: host,
+            bps: retryRes.bps,
+            bytes: retryRes.bytes,
+            isEstimated: true,
+          );
+        }
       }
 
-      final elapsedUs = max(100, sw.elapsedMicroseconds);
-      final sec = elapsedUs / 1000000.0;
-      final bps = receivedBytes / sec;
-
-      return (bps: bps, bytes: receivedBytes);
+      // 仍失败：判定为「未能测出」（区别于速度为 0）
+      return CdnCandidateProbeResult.unmeasured(host);
     } catch (_) {
-      return null;
+      return CdnCandidateProbeResult.unmeasured(host);
+    } finally {
+      candidateSw.stop();
     }
   }
 
@@ -345,7 +501,8 @@ class CdnRacer {
 
     final client = _client;
     final batchSw = Stopwatch()..start();
-    final results = <({String host, double bps, int bytes})>[];
+    final allProbeResults = <String, CdnCandidateProbeResult>{};
+    final results = <CdnCandidateProbeResult>[];
     int totalBytes = 0;
     int completedCount = 0;
 
@@ -361,7 +518,7 @@ class CdnRacer {
         }
         final host = toProbe[nextIndex++];
         runningCount++;
-        final remainingMs = max(50, probeBudgetMs - elapsed);
+        final remainingMs = max(80, probeBudgetMs - elapsed);
         final deadline = Duration(milliseconds: remainingMs);
 
         _probeSingleCandidate(
@@ -371,14 +528,16 @@ class CdnRacer {
           deadline: deadline,
         ).then((res) {
           runningCount--;
-          if (res != null) {
+          allProbeResults[host] = res;
+          if (res.isSuccessful) {
             completedCount++;
             totalBytes += res.bytes;
-            results.add((host: host, bps: res.bps, bytes: res.bytes));
+            results.add(res);
           }
           scheduleWorkers();
         }).catchError((_) {
           runningCount--;
+          allProbeResults[host] = CdnCandidateProbeResult.unmeasured(host);
           scheduleWorkers();
         });
       }
@@ -406,23 +565,52 @@ class CdnRacer {
 
     lastTotalSampleBytes = totalBytes;
 
+    // 候选详细测速汇总（明确区分未能测出与估算/实测）
+    final candidateSummaries = <String>[];
+    for (final host in toProbe) {
+      final res = allProbeResults[host];
+      final shortName = shortNodeName(host);
+      if (res != null && res.isSuccessful) {
+        final mbps = (res.bps / (1024 * 1024)).toStringAsFixed(2);
+        candidateSummaries.add('$shortName=$mbps${res.isEstimated ? "(估算)" : ""}');
+      } else {
+        candidateSummaries.add('$shortName=0.00(未能测出)');
+      }
+    }
+
     if (results.isEmpty) {
-      log('[BTR] CDN 竞速: 全部失败 → 不改变现役状态');
+      log(
+        '[BTR] CDN 竞速: 所有候选均未能测出速度（当前网络到 B 站节点无响应） → 不改变现役状态 '
+        '候选 ${candidateSummaries.join(' ')} 用时=${batchSw.elapsedMilliseconds}ms',
+      );
       return null;
     }
 
-    // 按吞吐降序选出最快候选
-    results.sort((a, b) => b.bps.compareTo(a.bps));
+    // 按吞吐降序选出最快候选：
+    // 下界估计取 0.6 倍保守折扣参与比较，避免把慢节点抬成最优；
+    // 折扣后速度相同时实测收满优先
+    results.sort((a, b) {
+      final aSortBps = a.isEstimated ? a.bps * 0.6 : a.bps;
+      final bSortBps = b.isEstimated ? b.bps * 0.6 : b.bps;
+      final cmp = bSortBps.compareTo(aSortBps);
+      if (cmp != 0) return cmp;
+      if (a.isEstimated != b.isEstimated) {
+        return a.isEstimated ? 1 : -1;
+      }
+      return b.bps.compareTo(a.bps);
+    });
     final fastest = results.first;
     final now = DateTime.now().millisecondsSinceEpoch;
 
-    // 迟滞判断：若 cached 仍在 TTL 内且 新的最快 < cached.bytesPerSec × hysteresisFactor
+    // 迟滞判断：若 cached 仍在 TTL 内且 新的最快有效速度 < cached.bytesPerSec × hysteresisFactor
     final activeCached = cached;
     if (!ignoreHysteresis && activeCached != null) {
-      if (fastest.bps < activeCached.bytesPerSec * hysteresisFactor) {
+      final effectiveFastestBps =
+          fastest.isEstimated ? fastest.bps * 0.6 : fastest.bps;
+      if (effectiveFastestBps < activeCached.bytesPerSec * hysteresisFactor) {
         log(
           '[BTR] CDN 竞速: 保持现役 ${activeCached.host} (${_formatSpeed(activeCached.bytesPerSec)}) —— '
-          '新最优 ${_formatSpeed(fastest.bps)} 未达迟滞 $hysteresisFactor×',
+          '新最优 ${_formatSpeed(fastest.bps)}${fastest.isEstimated ? " (估算)" : ""} 未达迟滞 $hysteresisFactor×',
         );
         return activeCached;
       }
@@ -434,13 +622,15 @@ class CdnRacer {
       measuredAtMs: now,
       candidateCount: toProbe.length,
       group: group,
+      isEstimated: fastest.isEstimated,
     );
     _cached = newResult;
 
     final sampleKb = (totalBytes / 1024).round();
     log(
       '[BTR] CDN 竞速: 分组=$group 候选=${toProbe.length} 完成=$completedCount '
-      '最优=${newResult.host} (${_formatSpeed(newResult.bytesPerSec)}) '
+      '候选详情=[${candidateSummaries.join(' ')}] '
+      '最优=${newResult.host} (${_formatSpeed(newResult.bytesPerSec)}${newResult.isEstimated ? " 估算" : ""}) '
       '用时=${batchSw.elapsedMilliseconds}ms 样本=${sampleKb}KB',
     );
 
