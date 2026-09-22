@@ -212,6 +212,28 @@ class CdnPool {
   /// 本次播放自适应决策得出的最优并发数（同一视频生命周期内保持）
   int? adaptiveConcurrency;
 
+  /// 标记乐观估计是否已被推翻（例如因队头反复饿死对冲触发自纠正，对齐任务 1.2）
+  bool isOptimisticEstimateInvalid = false;
+
+  /// 重置并推翻乐观估计（对齐任务 1.2）
+  void resetOptimisticEstimate() {
+    isOptimisticEstimateInvalid = true;
+    clearStickySingleConnection();
+    lastSingleConnectionSpeedBps = 0.0;
+    // 将用于偏好判定的历史过高测速打折降级，防止下次判定轻率选低档
+    final anchor = anchorUrl;
+    if (anchor != null && (_health[anchor]?.bps ?? 0) > 0) {
+      _health[anchor]!.bps = min(_health[anchor]!.bps, RangeCore.minPerConnectionBps);
+    }
+    if (_stickyUrl != null && (_health[_stickyUrl!]?.bps ?? 0) > 0) {
+      _health[_stickyUrl!]!.bps = min(_health[_stickyUrl!]!.bps, RangeCore.minPerConnectionBps);
+    }
+    if (_racerHintUrl != null && (_health[_racerHintUrl!]?.bps ?? 0) > 0) {
+      _health[_racerHintUrl!]!.bps = min(_health[_racerHintUrl!]!.bps, RangeCore.minPerConnectionBps);
+    }
+    clearRacerHint();
+  }
+
   /// 是否已切入单连接顺序透传模式（实测多连接无收益时开启）
   bool isSingleConnectionMode = false;
 
@@ -531,12 +553,15 @@ class CdnPool {
 
     if (matchedUrl == null) return;
 
+    // 对 64KB 短样本竞速结果打折保守化（对齐任务 2.2），防止瞬时虚高
+    final conservativeBps = bytesPerSec * RangeCore.shortSampleDiscount;
+
     // 越过分组时不写 hint / 粘性（只记录实测速度），否则 hint 会被
     // _getMainPoolUrls() 无条件前置进主池，直接绕过分组过滤。
     if (_conflictsServedGroup(matchedUrl)) {
       final h = _health.putIfAbsent(matchedUrl, CdnNodeHealth.new);
-      if (h.bps < bytesPerSec) {
-        h.bps = bytesPerSec;
+      if (h.bps < conservativeBps) {
+        h.bps = conservativeBps;
       }
       BtrLog.rateLimitedLog(
         'racer_hint_group',
@@ -548,10 +573,13 @@ class CdnPool {
     _racerHintHost = host;
     _racerHintUrl = matchedUrl;
     final h = _health.putIfAbsent(matchedUrl, CdnNodeHealth.new);
-    if (h.bps < bytesPerSec) {
-      h.bps = bytesPerSec;
+    if (h.bps < conservativeBps) {
+      h.bps = conservativeBps;
     }
-    setStickyUrl(matchedUrl);
+    // 若历史已被证明乐观估计错误（曾发生队头反复饿死），不再盲目锁定粘性节点
+    if (!isOptimisticEstimateInvalid) {
+      setStickyUrl(matchedUrl);
+    }
   }
 
   void clearRacerHint() {
@@ -1215,6 +1243,7 @@ class CdnPool {
     _rangeCursor = 0;
     _mediaRangeCount = 0;
     adaptiveConcurrency = null;
+    isOptimisticEstimateInvalid = false;
     _stickyUrl = null;
     _stickyLowSpeedStrikes = 0;
     _stickyPeakBps = 0.0;

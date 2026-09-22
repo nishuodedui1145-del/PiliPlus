@@ -139,7 +139,14 @@ abstract final class RangeCore {
 
   /// 切单连接的额外门限：单连接自身至少达到「码率 × 该倍数」才认为"不需要并发"。
   /// 否则（例如全网 0.1 MB/s 的死网络）切单连接会把多连接的聚合能力白白丢掉。
-  static const double singleConnectionAdequateMargin = 1.2;
+  /// 提高安全边际（从 1.2 提升至 1.5，对齐任务 2.1 建议），避免低估带宽需求。
+  static const double singleConnectionAdequateMargin = 1.5;
+
+  /// 播放基准目标吞吐倍数（用于慢块理论耗时评估与分片节拍，码率 × 1.2）
+  static const double playbackPacingMargin = 1.2;
+
+  /// 短样本（如 64~128KB 竞速/启动探测）测速结果打折系数（对齐任务 2.2，打七折保守化）
+  static const double shortSampleDiscount = 0.7;
 
   /// 拿不到码率参数时的"单连接够用"下限（0.4 MB/s ≈ 3.2 Mbps，够 1080p60）。
   /// 判据：单连接实测 ≥ 该值 且 聚合没比它快 1.3 倍 → 才切单连接。
@@ -291,7 +298,9 @@ abstract final class RangeCore {
         : defaultConcurrency;
     final effectiveTargetBps = (targetBps != null && targetBps > 0)
         ? targetBps
-        : requiredThroughputBytesPerSec(bitrateBytesPerSec);
+        : (bitrateBytesPerSec != null && bitrateBytesPerSec > 0
+            ? bitrateBytesPerSec * playbackPacingMargin
+            : singleAdequateFallbackBps);
     final perConnBps = effectiveTargetBps / c;
     if (perConnBps <= 0) return 1200.0;
     return (pieceBytes / perConnBps) * 1000.0;
@@ -316,7 +325,7 @@ abstract final class RangeCore {
     }
     final effectiveTargetBps = (targetBps != null && targetBps > 0)
         ? targetBps
-        : requiredThroughputBytesPerSec(bitrateBytesPerSec);
+        : (bitrateBytesPerSec * playbackPacingMargin);
     if (effectiveTargetBps <= 0) {
       return slowPieceThresholdDefault;
     }
@@ -380,16 +389,29 @@ abstract final class RangeCore {
 
   /// 起播阶段并发起手值公式的 ratio 分档阈值（对齐官方 native-mse-player.js:365-369）
   /// 代理层翻译：按 ratio = throughput / required 分档推导起播并发起手值
-  ///   ratio >= 3.0 → 起手 2 并发（网络极好，少量并发即够）
-  ///   ratio >= 1.8 → 起手 4 并发
-  ///   ratio >= 1.25 → 起手 6 并发
-  ///   ratio > 0    → 起手 8 并发（配置上限）
+  ///   ratio >= 3.0 → 起手 2 并发（网络极好且远超需求，少量并发即够）
+  ///   ratio >= 2.0 → 起手 4 并发
+  ///   ratio >= 1.0 → 起手 6 并发
+  ///   ratio < 1.0  → 起手 8 并发
   static const List<(double, int)> startupConcurrencyTiers = [
     (3.0, 2),
-    (1.8, 4),
-    (1.25, 6),
+    (2.0, 4),
+    (1.0, 6),
     (0.0, 8),
   ];
+
+  /// 并发升档档位阶梯（对齐任务 1.2）
+  static const List<int> concurrencyTiers = [2, 4, 6, 8, 12, 16, 24, 32];
+
+  /// 根据当前并发与上限计算升一档后的并发数（用于队头饿死连续对冲升档）
+  static int nextConcurrencyTier(int current, int maxCap) {
+    for (final tier in concurrencyTiers) {
+      if (tier > current) {
+        return min(tier, maxCap);
+      }
+    }
+    return maxCap;
+  }
 
   static final RegExp _mediaSuffixRegex =
       RegExp(r'\.(?:m4s|mp4|flv)(?:\?|$)', caseSensitive: false);

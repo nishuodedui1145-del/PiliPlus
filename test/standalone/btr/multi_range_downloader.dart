@@ -642,6 +642,7 @@ class MultiRangeDownloader {
     void Function(void Function() triggerHedge)? onHedgeReady,
     int Function()? getHeadIndex,
     double Function()? getAggregatedBps,
+    void Function(int pieceIndex)? onCriticalHedge,
   }) async {
     token.throwIfCancelled();
 
@@ -773,6 +774,7 @@ class MultiRangeDownloader {
               'hedge_critical_${piece.index}',
               '[BTR] 队头块强制对冲 piece#${piece.index}（耗时 ${elapsedMs}ms，窗口内）',
             );
+            onCriticalHedge?.call(piece.index);
           } else {
             // 3. Prefetch：保留聚合判据，但判据改为相对码率：仅当 聚合速率 < 目标码率 × 1.5 时才允许对冲
             final currentAggBps = getAggregatedBps?.call() ?? 0.0;
@@ -973,6 +975,7 @@ class MultiRangeDownloader {
     void Function(void Function() triggerHedge)? onHedgeReady,
     int Function()? getHeadIndex,
     double Function()? getAggregatedBps,
+    void Function(int pieceIndex)? onCriticalHedge,
   }) async {
     final winner = await _downloadPieceInternal(
       piece: piece,
@@ -986,6 +989,7 @@ class MultiRangeDownloader {
       onHedgeReady: onHedgeReady,
       getHeadIndex: getHeadIndex,
       getAggregatedBps: getAggregatedBps,
+      onCriticalHedge: onCriticalHedge,
     );
 
     if (winner.actualEnd >= piece.end) {
@@ -1046,6 +1050,7 @@ class MultiRangeDownloader {
         onHedgeReady: onHedgeReady,
         getHeadIndex: getHeadIndex,
         getAggregatedBps: getAggregatedBps,
+        onCriticalHedge: onCriticalHedge,
       );
 
       allChunks.add(subRes.bytes);
@@ -1613,6 +1618,74 @@ class _SlidingWindowStreamer {
   final Stopwatch _streamSw = Stopwatch();
   double _lastEvaluatedAggBps = 0.0;
 
+  // ── 任务 1：队头块强制对冲滑动窗口统计与连续对冲自纠正升档 ─────────────────
+  static const int kConsecutiveHedgesForRamp = 3;
+  static const int kObserveWindowPieces = 8;
+  static const int kSlidingWindowCapacity = 8;
+
+  int _consecutiveHeadHedges = 0;
+  int? _lastCriticalHedgedPieceIndex;
+  bool _inObserveWindow = false;
+  int _piecesSinceLastRamp = 0;
+  int _hedgesInObserveWindow = 0;
+  final Set<int> _hedgedPieces = {};
+  final List<bool> _recentHeadHedgeWindow = [];
+
+  void _onPieceCriticalHedge(int pieceIndex) {
+    if (kind != 'video') return; // 任务 3：音频轨维持 2 条不要被升档逻辑带上限
+    _hedgedPieces.add(pieceIndex);
+    if (_lastCriticalHedgedPieceIndex != pieceIndex) {
+      _lastCriticalHedgedPieceIndex = pieceIndex;
+      _consecutiveHeadHedges++;
+      if (_inObserveWindow) {
+        _hedgesInObserveWindow++;
+      }
+    }
+    if (_consecutiveHeadHedges >= kConsecutiveHedgesForRamp) {
+      _rampUpConcurrency();
+    }
+  }
+
+  void _rampUpConcurrency() {
+    if (kind != 'video') return; // 任务 3：音频轨维持 2 条不要被升档逻辑带上限
+    final maxCap = originalThreads.clamp(1, 512);
+    final newLimit = RangeCore.nextConcurrencyTier(limit, maxCap);
+    final oldLimit = limit;
+    final consecutive = _consecutiveHeadHedges;
+    _consecutiveHeadHedges = 0;
+    _inObserveWindow = true;
+    _piecesSinceLastRamp = 0;
+    _hedgesInObserveWindow = 0;
+
+    pool.resetOptimisticEstimate();
+    _resetStreamerOptimisticEstimate();
+
+    if (newLimit > oldLimit) {
+      limit = newLimit;
+      downloader.setConcurrency(newLimit, maxInFlightSockets: _maxSockets);
+      pool.adaptiveConcurrency = newLimit;
+      pool.updateSlowPieceThreshold(concurrency: newLimit);
+      BtrLog.log(
+        '[BTR] 并发升档: 连续 $consecutive 次队头对冲 → 并发 $newLimit (上限 $maxCap)',
+      );
+      _launchNext();
+    } else {
+      BtrLog.log(
+        '[BTR] 并发已达上限: 保持并发 $limit (上限 $maxCap)，已重置乐观估计',
+      );
+    }
+  }
+
+  void _resetStreamerOptimisticEstimate() {
+    _lastEvaluatedAggBps = 0.0;
+    _recentTransfers.clear();
+    _streamTotalBytes = 0;
+    _streamSw
+      ..reset()
+      ..start();
+    _switchToSingleConnection = false;
+  }
+
   bool get isAggregateBelowTarget {
     final baseTargetBps =
         RangeCore.requiredThroughputBytesPerSec(pool.videoBitrateBytesPerSec);
@@ -1758,6 +1831,30 @@ class _SlidingWindowStreamer {
         final chunk = _completedPieces.remove(_nextFlushIndex)!;
         final flushedIndex = _nextFlushIndex;
         _nextFlushIndex++;
+
+        // 维护滑动窗口内队头块对冲统计与升档后观察窗口
+        final wasHedged = _hedgedPieces.remove(flushedIndex);
+        _recentHeadHedgeWindow.add(wasHedged);
+        if (_recentHeadHedgeWindow.length > kSlidingWindowCapacity) {
+          _recentHeadHedgeWindow.removeAt(0);
+        }
+
+        if (!wasHedged) {
+          _consecutiveHeadHedges = 0;
+        }
+        if (flushedIndex == _lastCriticalHedgedPieceIndex) {
+          _lastCriticalHedgedPieceIndex = null;
+        }
+
+        if (_inObserveWindow) {
+          _piecesSinceLastRamp++;
+          if (_piecesSinceLastRamp >= kObserveWindowPieces) {
+            _inObserveWindow = false;
+            BtrLog.log(
+              '[BTR] 并发升档后观察: 队头对冲 $_hedgesInObserveWindow 次 / 观察窗口 $_piecesSinceLastRamp',
+            );
+          }
+        }
 
         // 清理已写出块的状态
         _headOfLineStartTimes.remove(flushedIndex);
@@ -1936,6 +2033,7 @@ class _SlidingWindowStreamer {
         isHedgeAllowed: () => isAggregateBelowTarget,
         getHeadIndex: _calculateHeadIndex,
         getAggregatedBps: getCurrentAggregatedBps,
+        onCriticalHedge: _onPieceCriticalHedge,
         onHedgeReady: (launcher) {
           _inFlightHedgeLaunchers[index] = launcher;
           final head = _calculateHeadIndex();
@@ -2010,7 +2108,9 @@ class _SlidingWindowStreamer {
                 !hasBenefit &&
                 singleNotWorse &&
                 singleAdequate &&
-                sampleTrustworthy;
+                sampleTrustworthy &&
+                !pool.isOptimisticEstimateInvalid &&
+                !_inObserveWindow;
 
             if (canSwitchToSingle && pool.tryRecordModeSwitch('多连接')) {
               // 任务 A、B、C、D：并发无收益且单连接不慢于多连接，在满足驻留与频率上限前提下切单连接并启用粘性偏好
@@ -2023,7 +2123,6 @@ class _SlidingWindowStreamer {
                 ..enableStickySingleConnection(multiBpsAtSwitch: aggBps)
                 ..updateSlowPieceThreshold(
                   concurrency: 1,
-                  targetBps: targetBps,
                 )
                 ..lastSingleConnectionSpeedBps = v1;
               _switchToSingleConnection = true;
@@ -2044,8 +2143,14 @@ class _SlidingWindowStreamer {
               final neededForTarget =
                   (targetBps / perConnBps).ceil().clamp(1, rampCap);
 
-              final decidedConcurrency = hasBenefit
-                  ? neededForTarget
+              // 任务 2.3：判据边缘（0.9~1.5 倍区间）时倾向多开连接；单连接未达安全倍数或已被推翻乐观估计时绝不降为 2
+              final isSingleFast = v1 >= targetBps * 1.5 &&
+                  v1 >= RangeCore.fastNodeBpsThreshold;
+              final decidedConcurrency = (hasBenefit ||
+                      !isSingleFast ||
+                      pool.isOptimisticEstimateInvalid ||
+                      _inObserveWindow)
+                  ? max(neededForTarget, min(RangeCore.maxRampConcurrency, limit))
                   : min(RangeCore.fastNodeConcurrency, limit);
 
               pool.adaptiveConcurrency = decidedConcurrency;
@@ -2059,7 +2164,6 @@ class _SlidingWindowStreamer {
 
               pool.updateSlowPieceThreshold(
                 concurrency: decidedConcurrency,
-                targetBps: targetBps,
               );
 
               final hedgeAllowed = aggBps < targetBps;

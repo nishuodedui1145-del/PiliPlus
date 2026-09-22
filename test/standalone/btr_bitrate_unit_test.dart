@@ -5,7 +5,7 @@ import 'package:PiliPlus/services/btr_proxy/range_core.dart';
 
 void main() {
   group('BTR 码率单位修正回归测试 (bit/s -> 字节/秒)', () {
-    test('1. 480p URL: bw=155643 解析出码率 ≈ 19455.4 B/s，required ≈ 23346 B/s', () {
+    test('1. 480p URL: bw=155643 解析出码率 ≈ 19455.4 B/s，required ≈ 29183.1 B/s', () {
       const url =
           'https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/11/22/33/test_480p.m4s?bw=155643&mid=123';
       final bitrate = RangeCore.parseBitrateBytesPerSec(url);
@@ -16,11 +16,11 @@ void main() {
 
       final requiredThroughput =
           RangeCore.requiredThroughputBytesPerSec(bitrate);
-      // 19455.375 * 1.2 = 23346.45 B/s
-      expect(requiredThroughput, closeTo(23346.0, 1.0));
+      // 19455.375 * 1.5 = 29183.0625 B/s
+      expect(requiredThroughput, closeTo(29183.1, 1.0));
     });
 
-    test('2. 4K URL: bw=19240000 -> 码率 2405000 B/s (≈2.41 MB/s)，target = 码率×1.2', () {
+    test('2. 4K URL: bw=19240000 -> 码率 2405000 B/s (≈2.41 MB/s)，target = 码率×1.5', () {
       const url =
           'https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/11/22/33/test_4k.m4s?bw=19240000&mid=123';
       final bitrate = RangeCore.parseBitrateBytesPerSec(url);
@@ -30,12 +30,12 @@ void main() {
       expect(bitrate, equals(2405000.0));
 
       final target = RangeCore.requiredThroughputBytesPerSec(bitrate);
-      // 2405000 * 1.2 = 2886000.0 B/s (即 2.886 MB/s ≈ 2.89 MB/s)
-      expect(target, equals(2405000.0 * 1.2));
-      expect(target, equals(2886000.0));
+      // 2405000 * 1.5 = 3607500.0 B/s (即 3.6075 MB/s ≈ 3.61 MB/s)
+      expect(target, equals(2405000.0 * 1.5));
+      expect(target, equals(3607500.0));
     });
 
-    test('3. 音频 URL: bw=1080000 -> 135000 B/s', () {
+    test('3. 音频 URL: bw=1080000 -> 135000 B/s，target = 码率×1.5 = 202500 B/s', () {
       const url =
           'https://upos-sz-mirrorali.bilivideo.com/upgcxcode/11/22/33/test_audio.m4s?bw=1080000&mid=123';
       final bitrate = RangeCore.parseBitrateBytesPerSec(url);
@@ -45,7 +45,8 @@ void main() {
       expect(bitrate, equals(135000.0));
 
       final target = RangeCore.requiredThroughputBytesPerSec(bitrate);
-      expect(target, equals(135000.0 * 1.2));
+      expect(target, equals(135000.0 * 1.5));
+      expect(target, equals(202500.0));
     });
 
     test('4. 慢块阈值：无并发信息回退固定 1200ms；有并发时按每连接份额动态算', () {

@@ -1013,11 +1013,15 @@ class BtrProxyServer {
           '已选并发=$adaptiveConcurrency (配置上限=$allocatedThreads)',
         );
       } else {
-        // 起播阶段：通过 startupConcurrencyTiers 决定起播并发起手值（对齐官方 native-mse-player.js:365-369）
+        // 起播阶段：通过 startupConcurrencyTiers 决定起播并发起手值（对齐官方 native-mse-player.js:365-369 与任务 2.2）
         final requiredBps = RangeCore.requiredThroughputBytesPerSec(
             pool.videoBitrateBytesPerSec);
-        final ratio = (requiredBps > 0 && probe.bps > 0)
-            ? (probe.bps / requiredBps)
+        // 对短样本（64KB）测速结果打折保守化（任务 2.2），若已被判定乐观估计不可信则不轻易算高
+        final effectiveProbeBps = pool.isOptimisticEstimateInvalid
+            ? 0.0
+            : (probe.bps * RangeCore.shortSampleDiscount);
+        final ratio = (requiredBps > 0 && effectiveProbeBps > 0)
+            ? (effectiveProbeBps / requiredBps)
             : 0.0;
         int tierConcurrency = allocatedThreads;
         for (final tier in RangeCore.startupConcurrencyTiers) {
