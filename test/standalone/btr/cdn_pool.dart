@@ -614,17 +614,34 @@ class CdnPool {
     return list.where(seen.add).take(4).toList();
   }
 
+  /// 当前池对应的流类型 ('video' | 'audio')
+  final String kind;
+
+  final double? _initialVideoBitrateBytesPerSec;
+
   CdnPool({
     required this.originalUrls,
     CdnBanList? banList,
     this.videoBitrateBytesPerSec,
     this.preferredGroup,
-  }) : banList = banList ?? CdnBanList() {
+    this.kind = 'video',
+  })  : banList = banList ?? CdnBanList(),
+        _initialVideoBitrateBytesPerSec = videoBitrateBytesPerSec {
     if (preferredGroup != null) {
       _activeGroup = preferredGroup!;
       _groupDecided = true;
     }
-    videoBitrateBytesPerSec ??= _extractBitrateBytesPerSec(originalUrls.isNotEmpty ? originalUrls.first : '');
+    if (videoBitrateBytesPerSec == null) {
+      if (kind == 'video') {
+        final raw = _extractBitrateBytesPerSec(
+          originalUrls.isNotEmpty ? originalUrls.first : '',
+        );
+        videoBitrateBytesPerSec = RangeCore.validateVideoBitrate(raw);
+      } else {
+        // 音频轨绝不能从自身 URL 的 bw 提取视频码率，保持 null
+        videoBitrateBytesPerSec = null;
+      }
+    }
     slowPieceThreshold = RangeCore.adaptiveSlowPieceThreshold(
       videoBitrateBytesPerSec,
       concurrency: null,
@@ -633,8 +650,9 @@ class CdnPool {
     _initCandidatePools();
   }
 
-  /// 打印码率解析埋点日志（仅打印 host，严禁打印含签名的完整 URL）
+  /// 打印码率解析埋点日志（仅打印 host，严禁打印含签名的完整 URL；仅对视频轨输出）
   void _logBitrateParsing() {
+    if (kind != 'video') return;
     final host = anchorHost;
     final hostPrefix = (host != null && host.isNotEmpty) ? 'host=$host, ' : '';
     final rate = videoBitrateBytesPerSec;
@@ -1213,7 +1231,14 @@ class CdnPool {
     _modeSwitchTimestamps.clear();
     multiBpsAtSwitch = 0.0;
     lastMultiBpsAtSwitch = 0.0;
-    videoBitrateBytesPerSec = _extractBitrateBytesPerSec(originalUrls.isNotEmpty ? originalUrls.first : '');
+    videoBitrateBytesPerSec = _initialVideoBitrateBytesPerSec ??
+        (kind == 'video'
+            ? RangeCore.validateVideoBitrate(
+                _extractBitrateBytesPerSec(
+                  originalUrls.isNotEmpty ? originalUrls.first : '',
+                ),
+              )
+            : null);
     slowPieceThreshold = RangeCore.adaptiveSlowPieceThreshold(
       videoBitrateBytesPerSec,
       concurrency: null,

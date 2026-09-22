@@ -748,6 +748,17 @@ class VideoDetailController extends GetxController
             .map((e) => e.host!)
             .toList();
         BtrProxyServer.instance.cdnRaceEnabled = Pref.btrCdnRace;
+        final candidateBws = data.dash?.video
+            ?.map((v) => v.bandWidth)
+            .whereType<int>()
+            .toList();
+        BtrProxyServer.instance.setVideoTrack(
+          id: firstVideo.id,
+          bandwidth: firstVideo.bandWidth,
+          width: firstVideo.width,
+          height: firstVideo.height,
+          candidateBandwidths: candidateBws,
+        );
         await BtrProxyServer.instance.ensureStarted();
       }
       final pVideo = canProxyVideo

@@ -73,6 +73,46 @@ class BtrProxyServer {
   Future<CdnRaceResult?>? _inFlightRace;
   int _raceGeneration = 0;
 
+  int? currentVideoTrackId;
+  int? currentVideoBandwidth;
+  int? currentVideoWidth;
+  int? currentVideoHeight;
+  double? currentVideoBitrateBytesPerSec;
+
+  /// 选定/更新当前播放的视频轨信息（由播放控制器在选轨/切换画质时调用）
+  void setVideoTrack({
+    required int id,
+    int? bandwidth,
+    int? width,
+    int? height,
+    List<int>? candidateBandwidths,
+  }) {
+    currentVideoTrackId = id;
+    currentVideoBandwidth = bandwidth;
+    currentVideoWidth = width;
+    currentVideoHeight = height;
+    if (bandwidth != null && bandwidth > 0) {
+      final bps = bandwidth / 8.0;
+      final validatedBps = RangeCore.validateVideoBitrateEx(
+        bitrateBytesPerSec: bps,
+        source: 'player_init',
+        otherCandidateBitratesBps: candidateBandwidths
+            ?.where((bw) => bw > 0)
+            .map((bw) => bw / 8.0)
+            .toList(),
+      );
+      currentVideoBitrateBytesPerSec = validatedBps;
+      BtrLog.log(
+        '[BTR] 播放轨选定: id=$id bandwidth=$bandwidth 分辨率=${width ?? 0}x${height ?? 0} → ${(bps / 1024 / 1024).toStringAsFixed(2)} MB/s',
+      );
+    } else {
+      currentVideoBitrateBytesPerSec = null;
+      BtrLog.log(
+        '[BTR] 播放轨选定: id=$id bandwidth=null 分辨率=${width ?? 0}x${height ?? 0}',
+      );
+    }
+  }
+
   BtrProxyServer._();
 
   int? get port => _server?.port;
@@ -369,6 +409,11 @@ class BtrProxyServer {
     racer.reset();
     _raceGeneration++;
     _inFlightRace = null;
+    currentVideoTrackId = null;
+    currentVideoBandwidth = null;
+    currentVideoWidth = null;
+    currentVideoHeight = null;
+    currentVideoBitrateBytesPerSec = null;
   }
 
   /// 生成供播放器（如 mpv）请求的本地 URL-safe 代理地址
@@ -390,6 +435,21 @@ class BtrProxyServer {
       _lastConfiguredConcurrency = threads;
       lastSampleUrl = originalUrl;
       lastGroup = group;
+      if (currentVideoBitrateBytesPerSec == null) {
+        final parsedBps = RangeCore.extractBitrateFromUrl(originalUrl);
+        if (parsedBps != null) {
+          final validatedBps = RangeCore.validateVideoBitrateEx(
+            bitrateBytesPerSec: parsedBps,
+            source: 'proxy_build_url',
+          );
+          if (validatedBps != null) {
+            currentVideoBitrateBytesPerSec = validatedBps;
+            BtrLog.log(
+              '[BTR] 码率解析: 从视频URL解析成功 bw=${(validatedBps * 8).round()} bps → ${(validatedBps / 1024 / 1024).toStringAsFixed(2)} MB/s',
+            );
+          }
+        }
+      }
     }
 
     final serverPort = _server?.port;
@@ -537,6 +597,9 @@ class BtrProxyServer {
             'overseas' => CdnGroup.overseas,
             _ => null,
           },
+          videoBitrateBytesPerSec:
+              (kind == 'video') ? currentVideoBitrateBytesPerSec : null,
+          kind: kind,
         ),
       );
       activePool = pool;
@@ -795,7 +858,7 @@ class BtrProxyServer {
               token: token,
             )
             .timeout(RangeCore.firstResponseDeadline);
-      } on TimeoutException {
+      } catch (e) {
         probeMaybe = null;
       }
 
@@ -807,13 +870,18 @@ class BtrProxyServer {
         // （PC 实测：只 flush() / bufferOutput=false + add(空) 都一个字节也发不出去）。
         // 所以这里用一个「1 字节 Range」把响应头顶出去：1 字节请求几乎只受 RTT 影响，
         // 慢节点也能在几百毫秒内返回；随后再继续补流。
-        final primer = await _fetchPrimerByte(
-          targetUrl: targetUrl,
-          start: start,
-          defaultHeaders: headers,
-          token: token,
-          pool: pool,
-        );
+        ({Uint8List bytes, int? total}) primer = (bytes: Uint8List(0), total: null);
+        try {
+          primer = await _fetchPrimerByte(
+            targetUrl: targetUrl,
+            start: start,
+            defaultHeaders: headers,
+            token: token,
+            pool: pool,
+          );
+        } catch (e) {
+          BtrLog.log('[BTR] 顶头首字节异常兜底: ${BtrLog.redact(e)}');
+        }
         final primerBytes = primer.bytes;
         // 顶头响应里带 Content-Range: bytes N-N/总长度 —— 顺手把总长度拿回来。
         // 有总长度就能回**精确的 206**，播放器才不会因为"不知道文件多大"而 seek 失败
@@ -847,9 +915,9 @@ class BtrProxyServer {
           );
           if (primerBytes.isNotEmpty) {
             request.response.add(primerBytes);
+            await request.response.flush();
+            bytesSent = true;
           }
-          await request.response.flush();
-          bytesSent = true;
           BtrLog.log(
             '[BTR] 首响应超时（>${RangeCore.firstResponseDeadline.inMilliseconds}ms）'
             '→ 用 ${primerBytes.length} 字节顶出响应头（206 精确区间 '
@@ -1551,7 +1619,10 @@ class BtrProxyServer {
         },
         cancelOnError: true,
       );
-      return await completer.future;
+      return await completer.future.timeout(RangeCore.primerFetchTimeout);
+    } catch (e) {
+      BtrLog.log('[BTR] 顶头首字节获取失败/超时 (${BtrLog.redact(e)})，降级为空字节');
+      return (bytes: Uint8List(0), total: null);
     } finally {
       token.removeListener(onCancel);
       try {

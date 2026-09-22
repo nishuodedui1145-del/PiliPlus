@@ -761,7 +761,9 @@ class MultiRangeDownloader {
                 Duration(milliseconds: slowThreshold.inMilliseconds - elapsedMs),
                 () {
                   if (!road2Started && !completer.isCompleted && !token.isCancelled) {
-                    launchRoad2();
+                    try {
+                      launchRoad2();
+                    } catch (_) {}
                   }
                 },
               );
@@ -839,6 +841,12 @@ class MultiRangeDownloader {
               }
               return;
             }
+            if (err is TimeoutException) {
+              BtrLog.rateLimitedLog(
+                'hedge_timeout_${piece.index}',
+                '[BTR] 对冲第二路超时 piece#${piece.index} 来源=${BtrLog.hostOf(pair[1])}，等待第一路或下一轮',
+              );
+            }
             // P0-2: UpstreamHttpException 降级为节点级可重试错误，记入 errors，让另一路或下一轮候选重试继续
             if (err is UpstreamHttpException) {
               BtrLog.rateLimitedLog(
@@ -902,14 +910,24 @@ class MultiRangeDownloader {
         // 第二路（慢块立刻补救，而不是干等）
         if (pair.length > 1) {
           if (startupMode) {
-            hedgeTimer = Timer(RangeCore.startupHedgeDelay, launchRoad2);
+            hedgeTimer = Timer(RangeCore.startupHedgeDelay, () {
+              try {
+                launchRoad2();
+              } catch (_) {}
+            });
           } else {
-            onHedgeReady?.call(launchRoad2);
+            onHedgeReady?.call(() {
+              try {
+                launchRoad2();
+              } catch (_) {}
+            });
             final effectiveDelay = slowThreshold;
             hedgeTimer = Timer(effectiveDelay, () {
-              if (isSlowPieceEligible?.call() ?? true) {
-                launchRoad2();
-              }
+              try {
+                if (isSlowPieceEligible?.call() ?? true) {
+                  launchRoad2();
+                }
+              } catch (_) {}
             });
           }
         }
@@ -1872,11 +1890,14 @@ class _SlidingWindowStreamer {
         _inFlightHedgeLaunchers[index]?.call();
       } else {
         Timer(Duration(milliseconds: thresholdMs - elapsedMs), () {
-          final currentHead = _calculateHeadIndex();
-          if ((index == currentHead || index == currentHead + 1) &&
-              !_completedPieces.containsKey(index)) {
-            _inFlightHedgeLaunchers[index]?.call();
-          }
+          try {
+            if (_completer.isCompleted || token.isCancelled || _isDegraded) return;
+            final currentHead = _calculateHeadIndex();
+            if ((index == currentHead || index == currentHead + 1) &&
+                !_completedPieces.containsKey(index)) {
+              _inFlightHedgeLaunchers[index]?.call();
+            }
+          } catch (_) {}
         });
       }
     }

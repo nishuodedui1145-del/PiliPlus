@@ -161,6 +161,55 @@ abstract final class RangeCore {
     return null;
   }
 
+  /// 别名：从 URL 提取码率
+  static double? extractBitrateFromUrl(String url) => parseBitrateBytesPerSec(url);
+
+  /// 视频最低合理码率下限（50 kbps = 6.25 KB/s）
+  static const double minReasonableVideoBitrateBps = 50.0 * 1000 / 8.0;
+
+  /// 视频码率合理性校验（低于最低合理下限或远低于同一次 playurl 中其他视频候选则判定为可疑非视频轨）
+  static double? validateVideoBitrate([
+    double? rawBytesPerSec,
+  ]) => validateVideoBitrateEx(rawBytesPerSec: rawBytesPerSec);
+
+  /// 扩展视频码率合理性校验（支持位置参数与命名参数两种调用方式）
+  static double? validateVideoBitrateEx({
+    double? rawBytesPerSec,
+    double? bitrateBytesPerSec,
+    String? source,
+    List<double>? candidateBitratesBytesPerSec,
+    List<double>? otherCandidateBitratesBps,
+  }) {
+    final effectiveRaw = rawBytesPerSec ?? bitrateBytesPerSec;
+    if (effectiveRaw == null || effectiveRaw <= 0) {
+      return null;
+    }
+    final bwBps = effectiveRaw * 8.0;
+    if (bwBps < minReasonableVideoBitrateBps * 8.0) {
+      BtrLog.log(
+        '[BTR] 码率解析可疑: bw=${bwBps.round()}（疑似非视频轨）'
+        '${source != null ? ' source=$source' : ''}',
+      );
+      return null;
+    }
+    final candidates = candidateBitratesBytesPerSec ?? otherCandidateBitratesBps;
+    if (candidates != null && candidates.isNotEmpty) {
+      final validCandidates =
+          candidates.where((b) => b * 8.0 >= minReasonableVideoBitrateBps * 8.0).toList();
+      if (validCandidates.isNotEmpty) {
+        final minCandidate = validCandidates.reduce(min);
+        if (effectiveRaw < minCandidate * 0.3) {
+          BtrLog.log(
+            '[BTR] 码率解析可疑: bw=${bwBps.round()}（疑似非视频轨）'
+            '${source != null ? ' source=$source' : ''}',
+          );
+          return null;
+        }
+      }
+    }
+    return effectiveRaw;
+  }
+
   /// 单条连接吞吐的下限（32 KB/s）；用于避免 perConn 过小导致反推出荒唐的并发数
   static const double minPerConnectionBps = 32.0 * 1024;
 
