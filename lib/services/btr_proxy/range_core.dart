@@ -359,8 +359,8 @@ abstract final class RangeCore {
   /// 至少 1 字节 body 时才真正发响应头 —— PC 实测确认），再转纯数据透传。
   static const Duration firstResponseDeadline = Duration(milliseconds: 1800);
 
-  /// "1 字节顶头"请求的超时（只受 RTT 影响，给足 1.2 秒）
-  static const Duration primerFetchTimeout = Duration(milliseconds: 1200);
+  /// "1 字节顶头"请求的超时：与既有首字节超时一致（跨海首字节常见 1~3s，避免 1.2s 过早超时退化为 200）
+  static const Duration primerFetchTimeout = firstByteTimeout;
 
   /// 启动测速整体时间上限（压到 0.4 秒：这个时间段内播放器在等第一个字节，
   /// 真机对比过 1.5 秒上限会让起播黑屏明显变长）

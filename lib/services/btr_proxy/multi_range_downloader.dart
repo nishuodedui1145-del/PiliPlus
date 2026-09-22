@@ -1618,10 +1618,10 @@ class _SlidingWindowStreamer {
   final Stopwatch _streamSw = Stopwatch();
   double _lastEvaluatedAggBps = 0.0;
 
-  // ── 任务 1：队头块强制对冲滑动窗口统计与连续对冲自纠正升档 ─────────────────
-  static const int kConsecutiveHedgesForRamp = 3;
-  static const int kObserveWindowPieces = 8;
-  static const int kSlidingWindowCapacity = 8;
+  // ── 任务 1：队头块强制对冲滑动窗口统计与滑动窗口自纠正升档 ─────────────────
+  static const int kHedgeRampThreshold = 2; // 最近 K 个队头块中有 2 次被对冲即升档
+  static const int kSlidingWindowCapacity = 6; // 滑动窗口容量 6 块
+  static const int kObserveWindowPieces = 8; // 升档后观察期（迟滞保护）8 块
 
   int _consecutiveHeadHedges = 0;
   int? _lastCriticalHedgedPieceIndex;
@@ -1641,18 +1641,26 @@ class _SlidingWindowStreamer {
         _hedgesInObserveWindow++;
       }
     }
-    if (_consecutiveHeadHedges >= kConsecutiveHedgesForRamp) {
-      _rampUpConcurrency();
+    if (_inObserveWindow) return; // 观察期迟滞保护，不触发升档
+
+    final windowHedges = _recentHeadHedgeWindow.where((h) => h).length;
+    final totalHedges = windowHedges + 1;
+    if (_consecutiveHeadHedges >= kHedgeRampThreshold ||
+        totalHedges >= kHedgeRampThreshold) {
+      _rampUpConcurrency(
+        reason: '窗口内 $totalHedges/${_recentHeadHedgeWindow.length + 1} 次队头对冲 (连续=$_consecutiveHeadHedges)',
+      );
     }
   }
 
-  void _rampUpConcurrency() {
+  void _rampUpConcurrency({String? reason}) {
     if (kind != 'video') return; // 任务 3：音频轨维持 2 条不要被升档逻辑带上限
+    if (_inObserveWindow) return; // 观察期迟滞保护
     final maxCap = originalThreads.clamp(1, 512);
     final newLimit = RangeCore.nextConcurrencyTier(limit, maxCap);
     final oldLimit = limit;
-    final consecutive = _consecutiveHeadHedges;
     _consecutiveHeadHedges = 0;
+    _recentHeadHedgeWindow.clear();
     _inObserveWindow = true;
     _piecesSinceLastRamp = 0;
     _hedgesInObserveWindow = 0;
@@ -1660,18 +1668,19 @@ class _SlidingWindowStreamer {
     pool.resetOptimisticEstimate();
     _resetStreamerOptimisticEstimate();
 
+    final triggerReason = reason ?? '滑动窗口计数超限';
     if (newLimit > oldLimit) {
       limit = newLimit;
       downloader.setConcurrency(newLimit, maxInFlightSockets: _maxSockets);
       pool.adaptiveConcurrency = newLimit;
       pool.updateSlowPieceThreshold(concurrency: newLimit);
       BtrLog.log(
-        '[BTR] 并发升档: 连续 $consecutive 次队头对冲 → 并发 $newLimit (上限 $maxCap)',
+        '[BTR] 并发升档: $triggerReason → 并发 $newLimit (上限 $maxCap)',
       );
       _launchNext();
     } else {
       BtrLog.log(
-        '[BTR] 并发已达上限: 保持并发 $limit (上限 $maxCap)，已重置乐观估计',
+        '[BTR] 并发已达上限: $triggerReason → 保持并发 $limit (上限 $maxCap)，已重置乐观估计',
       );
     }
   }
@@ -1852,6 +1861,13 @@ class _SlidingWindowStreamer {
             _inObserveWindow = false;
             BtrLog.log(
               '[BTR] 并发升档后观察: 队头对冲 $_hedgesInObserveWindow 次 / 观察窗口 $_piecesSinceLastRamp',
+            );
+          }
+        } else {
+          final windowHedges = _recentHeadHedgeWindow.where((h) => h).length;
+          if (windowHedges >= kHedgeRampThreshold) {
+            _rampUpConcurrency(
+              reason: '滑动窗口已写出块对冲 $windowHedges/${_recentHeadHedgeWindow.length} 次',
             );
           }
         }

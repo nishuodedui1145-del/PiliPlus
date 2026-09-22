@@ -722,6 +722,7 @@ class BtrProxyServer {
           token: token,
           defaultHeaders: headers,
           onByteSent: () => bytesSent = true,
+          onSinkError: () => sinkErrored = true,
           pool: pool,
           downloader: downloader,
         );
@@ -742,6 +743,7 @@ class BtrProxyServer {
           token: token,
           defaultHeaders: headers,
           onByteSent: () => bytesSent = true,
+          onSinkError: () => sinkErrored = true,
           pool: pool,
           downloader: downloader,
         );
@@ -886,8 +888,10 @@ class BtrProxyServer {
         // 顶头响应里带 Content-Range: bytes N-N/总长度 —— 顺手把总长度拿回来。
         // 有总长度就能回**精确的 206**，播放器才不会因为"不知道文件多大"而 seek 失败
         // （真机 14:50 出现 Seek failed (to 3490, size -38) 的循环，就是因为 200 无长度）。
-        final resolvedTotal =
-            primer.total ?? totalLength ?? _totalLengthCache[targetUrl];
+        final resolvedTotal = primer.total ??
+            totalLength ??
+            _totalLengthCache[targetUrl] ??
+            pool.verifiedTotalLength;
         if (resolvedTotal != null && resolvedTotal > 0) {
           _totalLengthCache[targetUrl] = resolvedTotal;
         }
@@ -913,10 +917,21 @@ class BtrProxyServer {
             HttpHeaders.contentLengthHeader,
             '${end - start + 1}',
           );
-          if (primerBytes.isNotEmpty) {
-            request.response.add(primerBytes);
-            await request.response.flush();
-            bytesSent = true;
+          if (primerBytes.isNotEmpty &&
+              !sinkErrored &&
+              !sinkClosed &&
+              _terminatedResponses[request.response] != true) {
+            try {
+              request.response.add(primerBytes);
+              await request.response.flush();
+              bytesSent = true;
+            } catch (e) {
+              sinkErrored = true;
+              BtrLog.log(
+                '[BTR] 下游写入冲突(已防御): 场景=顶头首字节(206)写入抛错: ${BtrLog.redact(e)}',
+              );
+              rethrow;
+            }
           }
           BtrLog.log(
             '[BTR] 首响应超时（>${RangeCore.firstResponseDeadline.inMilliseconds}ms）'
@@ -931,6 +946,7 @@ class BtrProxyServer {
             fromOffset: nextOffset,
             endOffset: end,
             onByteSent: () => bytesSent = true,
+            onSinkError: () => sinkErrored = true,
             downloader: downloader,
             pool: pool,
           );
@@ -944,20 +960,25 @@ class BtrProxyServer {
           HttpHeaders.contentTypeHeader,
           'video/mp4',
         );
-        if (primerBytes.isNotEmpty && !sinkErrored && !sinkClosed) {
+        if (primerBytes.isNotEmpty &&
+            !sinkErrored &&
+            !sinkClosed &&
+            _terminatedResponses[request.response] != true) {
           try {
             request.response.add(primerBytes);
             await request.response.flush();
             bytesSent = true;
           } catch (e) {
             sinkErrored = true;
+            BtrLog.log(
+              '[BTR] 下游写入冲突(已防御): 场景=顶头首字节(200)写入抛错: ${BtrLog.redact(e)}',
+            );
             rethrow;
           }
         }
         BtrLog.log(
-          '[BTR] 首响应超时（>${RangeCore.firstResponseDeadline.inMilliseconds}ms）'
-          '→ 用 ${primerBytes.length} 字节顶出响应头（总长度未知，退化为 200）: '
-          '节点=${BtrLog.hostOf(targetUrl)}',
+          '[BTR] 首响应超时后退化为 200: 原因=上游顶头探测未返回 Content-Range 且无历史总长度缓存 (resolvedTotal=null), '
+          '用 ${primerBytes.length} 字节顶出响应头: 节点=${BtrLog.hostOf(targetUrl)}',
         );
         BtrLog.log(
           '[BTR] 顶头续流: start=$start 已写=${primerBytes.length} 续流起点=$nextOffset '
@@ -1066,13 +1087,18 @@ class BtrProxyServer {
       }
 
       // 先把探测到的 head 数据按序写出给客户端
-      if (!sinkErrored && !sinkClosed) {
+      if (!sinkErrored &&
+          !sinkClosed &&
+          _terminatedResponses[request.response] != true) {
         try {
           request.response.add(probe.headBytes);
           await request.response.flush();
           bytesSent = true;
         } catch (e) {
           sinkErrored = true;
+          BtrLog.log(
+            '[BTR] 下游写入冲突(已防御): 场景=探测首块数据写入抛错: ${BtrLog.redact(e)}',
+          );
           rethrow;
         }
       }
@@ -1138,13 +1164,23 @@ class BtrProxyServer {
             originalThreads: allocatedThreads,
             kind: kind,
             onOrderedChunk: (chunk) async {
-              if (sinkErrored || sinkClosed) return;
+              if (sinkErrored ||
+                  sinkClosed ||
+                  _terminatedResponses[request.response] == true) {
+                BtrLog.log(
+                  '[BTR] 下游写入冲突(已防御): 场景=向已关闭/已报错下游sink推入并发分块',
+                );
+                return;
+              }
               try {
                 request.response.add(chunk);
                 await request.response.flush();
                 bytesSent = true;
               } catch (e) {
                 sinkErrored = true;
+                BtrLog.log(
+                  '[BTR] 下游写入冲突(已防御): 场景=并发分块写入抛错: ${BtrLog.redact(e)}',
+                );
                 rethrow;
               }
             },
@@ -1630,7 +1666,7 @@ class BtrProxyServer {
     } finally {
       token.removeListener(onCancel);
       try {
-        respSub?.cancel();
+        await respSub?.cancel();
       } catch (_) {}
       try {
         req?.abort();
@@ -1789,6 +1825,36 @@ class BtrProxyServer {
     Completer<void>? activeRoundCompleter;
     Timer? currentStallTimer;
 
+    Future<void> writeChain = Future.value();
+    bool isSinkErrored = false;
+
+    Future<void> safeWriteChunk(List<int> chunk) {
+      final next = writeChain.then((_) async {
+        if (isSinkErrored ||
+            _terminatedResponses[clientRequest.response] == true) {
+          BtrLog.log(
+            '[BTR] 下游写入冲突(已防御): 场景=向已关闭/已报错下游sink写入直连数据',
+          );
+          return;
+        }
+        try {
+          clientRequest.response.add(chunk);
+          written += chunk.length;
+          await clientRequest.response.flush();
+          onByteSent?.call();
+        } catch (e) {
+          isSinkErrored = true;
+          onSinkError?.call();
+          BtrLog.log(
+            '[BTR] 下游写入冲突(已防御): 场景=直连数据写入抛错: ${BtrLog.redact(e)}',
+          );
+          rethrow;
+        }
+      });
+      writeChain = next.catchError((_) {});
+      return next;
+    }
+
     void onWatchdogTokenCancel() {
       currentStallTimer?.cancel();
       try {
@@ -1814,21 +1880,29 @@ class BtrProxyServer {
         bool isDone = false;
         bool cancelledByUs = false;
 
+        StreamSubscription<List<int>>? sub;
+
         Timer? stallTimer;
         void resetStallTimer() {
           stallTimer?.cancel();
-          stallTimer = Timer(stallTimeout, () {
+          stallTimer = Timer(stallTimeout, () async {
             isStalled = true;
             cancelledByUs = true;
-            roundCompleter.complete();
+            try {
+              await sub?.cancel();
+            } catch (_) {}
+            try {
+              await writeChain;
+            } catch (_) {}
+            if (!roundCompleter.isCompleted) {
+              roundCompleter.complete();
+            }
           });
           currentStallTimer = stallTimer;
         }
 
-        StreamSubscription<List<int>>? sub;
         sub = currentResp.listen(
           (chunk) async {
-            currentSub = sub;
             resetStallTimer();
             stallWatch.reset();
             sub?.pause();
@@ -1841,6 +1915,7 @@ class BtrProxyServer {
                   earlyExit = true;
                   cancelledByUs = true;
                   await sub?.cancel();
+                  await writeChain;
                   if (!roundCompleter.isCompleted) {
                     roundCompleter.complete();
                   }
@@ -1852,15 +1927,7 @@ class BtrProxyServer {
                 }
               }
 
-              try {
-                clientRequest.response.add(data);
-                written += data.length;
-                await clientRequest.response.flush();
-                onByteSent?.call();
-              } catch (e) {
-                onSinkError?.call();
-                rethrow;
-              }
+              await safeWriteChunk(data);
 
               intervalBytes += data.length;
               if (intervalBytes >= 1024 * 1024 ||
@@ -1894,6 +1961,7 @@ class BtrProxyServer {
               if (earlyExit) {
                 cancelledByUs = true;
                 await sub?.cancel();
+                await writeChain;
                 if (!roundCompleter.isCompleted) {
                   roundCompleter.complete();
                 }
@@ -1902,6 +1970,9 @@ class BtrProxyServer {
               cancelledByUs = true;
               try {
                 await sub?.cancel();
+              } catch (_) {}
+              try {
+                await writeChain;
               } catch (_) {}
               if (!roundCompleter.isCompleted) {
                 roundCompleter.completeError(e, st);
@@ -1922,14 +1993,18 @@ class BtrProxyServer {
               roundCompleter.completeError(e, st);
             }
           },
-          onDone: () {
+          onDone: () async {
             isDone = true;
+            try {
+              await writeChain;
+            } catch (_) {}
             if (!roundCompleter.isCompleted) {
               roundCompleter.complete();
             }
           },
           cancelOnError: true,
         );
+        currentSub = sub;
 
         resetStallTimer();
 
@@ -1942,6 +2017,9 @@ class BtrProxyServer {
           stallTimer?.cancel();
           try {
             await sub.cancel();
+          } catch (_) {}
+          try {
+            await writeChain;
           } catch (_) {}
         }
 
@@ -1967,6 +2045,12 @@ class BtrProxyServer {
           await Future.delayed(const Duration(milliseconds: 500));
           token.throwIfCancelled();
 
+          try {
+            await currentSub?.cancel();
+          } catch (_) {}
+          try {
+            await writeChain;
+          } catch (_) {}
           try {
             currentReq?.abort();
           } catch (_) {}
@@ -2023,7 +2107,10 @@ class BtrProxyServer {
       token.removeListener(onWatchdogTokenCancel);
       currentStallTimer?.cancel();
       try {
-        currentSub?.cancel();
+        await currentSub?.cancel();
+      } catch (_) {}
+      try {
+        await writeChain;
       } catch (_) {}
       try {
         currentReq?.abort();
