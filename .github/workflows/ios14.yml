@@ -1,0 +1,85 @@
+name: Build for iOS 14 (BTR)
+
+# ---------------------------------------------------------------------------
+# BTR 变体的 iOS 14 构建。
+# 与 .github/workflows/ios.yml 的区别：
+#   - Flutter 走 pubspec.yaml 里 pin 的 3.44.9（3.45+ 的引擎下限是 iOS 15，装不到 iOS 14）
+#   - 打补丁用 lib/scripts/patch_ios14.ps1（selectable_region / scrollable_gesture 换 3.44.9 移植版）
+#   - 构建完先跑 lib/scripts/check_ios14_minos.sh 逐个 Mach-O 验证下限 <= iOS 14，不达标就红
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "tag"
+        required: false
+        default: ""
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "tag"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  build-ios14-app:
+    name: Release iOS 14
+    runs-on: macos-26
+    env:
+      IPHONEOS_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version-file: pubspec.yaml
+          cache: true
+
+      - name: Toolchain info
+        run: |
+          flutter --version
+          dart --version
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Set and Extract version
+        shell: pwsh
+        run: lib/scripts/build.ps1
+
+      - name: Apply Patch
+        shell: pwsh
+        run: lib/scripts/patch_ios14.ps1 iOS
+
+      - name: Build iOS
+        run: |
+          flutter build ios --release --no-codesign --dart-define-from-file=pili_release.json --no-pub
+          bash lib/scripts/check_ios14_minos.sh build/ios/iphoneos/Runner.app 14.0
+          ln -sf ./build/ios/iphoneos Payload
+          # make AltSign happy...
+          find Payload/Runner.app/Frameworks -type d -name "*.framework" -exec codesign --force --sign - --preserve-metadata=identifier,entitlements {} \;
+          zip -r9 PiliPlus-BTR-ios14_${{env.version}}.ipa Payload/Runner.app
+
+      - name: Release
+        if: ${{ github.event.inputs.tag != '' }}
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          name: ${{ github.event.inputs.tag }}
+          files: |
+            PiliPlus-BTR-ios14_*.ipa
+
+      - name: Upload ios14 release
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          name: iOS14-release
+          path: PiliPlus-BTR-ios14_*.ipa
+          retention-days: 14
