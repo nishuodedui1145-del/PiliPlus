@@ -166,7 +166,7 @@ abstract class CommonPublishPageState<T extends CommonPublishPage>
 
   Future<void> hidePanel([_]) async {
     if (focusNode.hasFocus) {
-      await Future.pause(const Duration(milliseconds: 100));
+      await Future.delayed(const Duration(milliseconds: 100));
       if (!mounted) return;
       focusNode.unfocus();
     }

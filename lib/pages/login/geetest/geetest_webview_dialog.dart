@@ -7,6 +7,7 @@ import 'package:PiliPlus/plugin/linux_webview.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:get/get.dart';
 import 'package:material_ui/material_ui.dart';
+import 'package:PiliPlus/pages/login/geetest/geetest_plugin.dart';
 
 class GeetestWebviewDialog extends StatefulWidget {
   const GeetestWebviewDialog(this.gt, this.challenge, {super.key});
@@ -18,6 +19,7 @@ class GeetestWebviewDialog extends StatefulWidget {
   State<GeetestWebviewDialog> createState() => _GeetestWebviewDialogState();
 
   static Future<Map<String, dynamic>?> geetest(String gt, String challenge) {
+    return GeetestPlugin.geetest(gt, challenge);
     return showDialog<Map<String, dynamic>>(
       context: Get.context!,
       builder: (context) => GeetestWebviewDialog(gt, challenge),

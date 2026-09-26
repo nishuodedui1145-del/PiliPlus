@@ -2,7 +2,8 @@ import 'dart:math' show max;
 
 import 'package:PiliPlus/common/widgets/gesture/horizontal_drag_gesture_recognizer.dart';
 import 'package:PiliPlus/utils/storage_pref.dart';
-import 'package:flutter/gestures.dart' show HorizontalDragGestureRecognizer;
+import 'package:flutter/gestures.dart'
+    show HorizontalDragGestureRecognizer, DeviceGestureSettings;
 import 'package:get/get.dart';
 import 'package:material_ui/material_ui.dart';
 
@@ -145,6 +146,10 @@ class SlideDragGestureRecognizer extends HorizontalDragGestureRecognizer {
   bool isPointerAllowed(PointerEvent event) {
     return isDxAllowed(event.localPosition.dx) && super.isPointerAllowed(event);
   }
+
+  @override
+  DeviceGestureSettings get gestureSettings =>
+      const DeviceGestureSettings(touchSlop: 5.0);
 }
 
 class TabBarDragGestureRecognizer

@@ -346,7 +346,7 @@ Future<void> _screenShot(BuildContext context, SuperChatItem item) async {
     ),
     constraints: const BoxConstraints(maxWidth: 400),
     pixelRatio: 3,
-    future: Future.pause, // wait for asset async loaded
+    future: () => Future.delayed(Duration.zero), // wait for asset async loaded
   );
   final bytes = await image.toByteData(format: .png);
   image.dispose();
