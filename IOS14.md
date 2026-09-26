@@ -31,6 +31,19 @@ gh workflow run "Build for iOS 14 (BTR)" --ref ios14 -R nishuodedui1145-del/Pili
 产物：`PiliPlus-BTR-ios14_<版本>.ipa`（artifact 名 `iOS14-release`，未签名，需要自签/AltStore 之类装）。
 带 `tag` 输入时同时发 Release。
 
+### 已验证的构建（2026-09-27）
+
+| 项 | 值 |
+|---|---|
+| run | 36255867438（`macos-26` / Xcode 26.6 / Flutter stable-3.44.9-arm64） |
+| 结果 | ✅ success |
+| 产物 | `PiliPlus-BTR-ios14_2.1.4+5419.ipa`（24.2 MB） |
+| `Runner` 主二进制 | iOS 14.0 |
+| `Frameworks/Flutter.framework/Flutter` | **iOS 13.0**（同一位置在 3.47.4 上是 15.0 → 这就是降版本的目的） |
+| `Frameworks/App.framework/App` | iOS 13.0 |
+| 其余 27 个 Mach-O | 11.0 ~ 14.0，全部 ≤ 14.0 |
+| `Info.plist MinimumOSVersion` | 14.0 |
+
 ## 本地怎么复现
 
 macOS 上（本机 Windows 编不了 iOS）：
