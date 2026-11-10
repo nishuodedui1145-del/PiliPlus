@@ -847,6 +847,27 @@ abstract final class Pref {
     };
   }
 
+  /// R5-A：BTR 开启时的 mpv 缓冲参数（与 initBuffer / initLiveBuffer 隔离，不影响音频页与直播）。
+  ///
+  /// 说明：Dart SDK（dart:io Platform / ProcessInfo）及仓库现有设备工具（DeviceUtils / AndroidHelper）
+  /// 均无跨平台同步读取设备物理总内存的可靠 API，按规范直接采用 32MiB 兜底；数值集中于此便于后续真机调参。
+  static Map<String, String> initBtrBuffer([double playbackSpeed = 1.0]) {
+    const double btrCacheSecs = 60.0;
+    const int btrHysteresisSecs = 5;
+    const int btrFallbackBufferMiB = 32;
+    const int btrNetworkTimeoutSecs = 15;
+    final bufSec = btrCacheSecs * playbackSpeed;
+    final bufSiz = (btrFallbackBufferMiB * 0x100000).toStringAsFixed(0);
+    return {
+      'cache': 'yes',
+      'cache-secs': bufSec.toStringAsFixed(3),
+      'demuxer-hysteresis-secs': '$btrHysteresisSecs',
+      'demuxer-max-bytes': bufSiz,
+      'demuxer-max-back-bytes': bufSiz,
+      'network-timeout': '$btrNetworkTimeoutSecs',
+    };
+  }
+
   static String get audioOutput => _setting.get(
     SettingBoxKey.audioOutput,
     defaultValue: AudioOutput.defaultValue,

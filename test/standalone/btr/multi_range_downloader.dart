@@ -67,16 +67,19 @@ class InconsistentTotalLengthException implements Exception {
 
 /// 优先级的信号量，用于并发限流
 class PrioritySemaphore {
+  final String name;
   int limit;
   int _active = 0;
+  int _generation = 0;
   int _sequence = 0;
   int _totalAcquires = 0;
   int _totalReleases = 0;
   final List<_SemaphoreEntry> _queue = [];
 
-  PrioritySemaphore(this.limit);
+  PrioritySemaphore(this.limit, {this.name = 'main'});
 
   int get activeCount => _active;
+  int get generation => _generation;
   int get queueLength => _queue.length;
   int get totalAcquires => _totalAcquires;
   int get totalReleases => _totalReleases;
@@ -104,10 +107,12 @@ class PrioritySemaphore {
     }
 
     final completer = Completer<void Function()>();
+    final acquireGeneration = _generation;
     final entry = _SemaphoreEntry(
       completer: completer,
       priority: priority,
       sequence: _sequence++,
+      generation: acquireGeneration,
       token: token,
     );
 
@@ -143,16 +148,35 @@ class PrioritySemaphore {
         }
         continue;
       }
+      if (entry.generation != _generation) {
+        if (!entry.completer.isCompleted) {
+          entry.completer.completeError(
+            CancellationException('PrioritySemaphore generation mismatch'),
+          );
+        }
+        continue;
+      }
 
+      final acquiredGeneration = entry.generation;
       _active++;
       _totalAcquires++;
       void release() {
         if (entry.released) return;
         entry.released = true;
-        _totalReleases++;
         if (entry.token != null && entry.cancelListener != null) {
           entry.token!.removeListener(entry.cancelListener!);
         }
+        // R3-B（审查 09）：核验代际号，上一视频/reset 前残留分块的 release 不得扣减新代际 _active、不触发 _drain
+        if (acquiredGeneration != _generation) {
+          BtrLog.rateLimitedLog(
+            'semaphore_stale_release_$name',
+            '[BTR] PrioritySemaphore($name) 忽略跨代际 release: '
+            'acquiredGen=$acquiredGeneration != currentGen=$_generation '
+            '(active=$_active)',
+          );
+          return;
+        }
+        _totalReleases++;
         if (_active <= 0) {
           BtrLog.log(
             '[BTR] 警告: PrioritySemaphore 不变量违规: release 时 active=$_active <= 0 '
@@ -164,6 +188,7 @@ class PrioritySemaphore {
             '[BTR] 槽位归还不平衡: acquired=$_totalAcquires released=$_totalReleases',
           );
         }
+        // 保留钳位仅作双保险，跨代际归还已由上方 _generation 核验拦截
         _active = max(0, _active - 1);
         _drain();
       }
@@ -191,9 +216,10 @@ class PrioritySemaphore {
     }
   }
 
-  /// 归零信号量状态（在途计数、排队队列、统计）
+  /// 归零信号量状态（在途计数、排队队列、统计），并递增代际号隔离旧在途请求
   void reset() {
     cancelAll('PrioritySemaphore reset');
+    _generation++;
     _active = 0;
     _totalAcquires = 0;
     _totalReleases = 0;
@@ -204,6 +230,7 @@ class _SemaphoreEntry {
   final Completer<void Function()> completer;
   final int priority;
   final int sequence;
+  final int generation;
   final CancellationToken? token;
   void Function()? cancelListener;
   bool released = false;
@@ -212,6 +239,7 @@ class _SemaphoreEntry {
     required this.completer,
     required this.priority,
     required this.sequence,
+    required this.generation,
     required this.token,
   });
 }
@@ -251,12 +279,21 @@ class StartupProbeResult {
   });
 }
 
+/// 标记新视频尚未完成首次滑动窗口分块样本自适应并发评估：
+/// 代理层起播阶段会预先向 pool.adaptiveConcurrency 写入起播分档起手值（2~8），
+/// 通过此标记区分「仅写入起播起手值」与「已完成首批分块实测评估」，确保首批分块仍能触发自适应评估与动态升档。
+final Expando<bool> _pendingStartupEvaluation = Expando<bool>();
+
 /// 多 Range 并发下载调度核心（移植自 BTR 的 idm-downloader.js）
 class MultiRangeDownloader {
   final HttpClient _httpClient;
   final PrioritySemaphore _semaphore;
-  final PrioritySemaphore _probeSemaphore =
-      PrioritySemaphore(RangeCore.maxProbeConcurrency);
+  // R3-A（审查 08）：探速池独立于视频/音频主池，启动批次容量提升至 startupProbeConcurrency(4)，不与视频 piece 争抢
+  final PrioritySemaphore _probeSemaphore = PrioritySemaphore(
+    RangeCore.startupProbeConcurrency,
+    name: 'probe',
+  );
+  int _activeStartupProbeBatches = 0;
   Map<String, String> defaultHeaders;
   int _concurrency;
   int _maxInFlightSockets;
@@ -266,13 +303,21 @@ class MultiRangeDownloader {
   int get activeInFlightSockets => _semaphore.activeCount;
   int get activeProbeSockets => _probeSemaphore.activeCount;
 
-  /// 为降级、重试或外部路径申请 socket 预算槽位（探速使用独立小预算 <= 2，不与视频 piece 争抢）
+  /// 为降级、重试或外部路径申请 socket 预算槽位（探速使用独立池：启动批次容量 4，稳态容量 2，不与视频 piece 争抢）
   Future<void Function()> acquireSocket(
     CancellationToken? token, {
     int priority = 0,
     String? caller,
   }) {
     if (caller != null && caller.startsWith('probe')) {
+      final isStartupBatch =
+          _activeStartupProbeBatches > 0 || caller == 'probe_startup';
+      final desiredLimit = isStartupBatch
+          ? RangeCore.startupProbeConcurrency
+          : RangeCore.maxProbeConcurrency;
+      if (_probeSemaphore.limit != desiredLimit) {
+        _probeSemaphore.setLimit(desiredLimit);
+      }
       return _probeSemaphore.acquire(token, priority: priority, caller: caller);
     }
     return _semaphore.acquire(token, priority: priority, caller: caller);
@@ -289,6 +334,7 @@ class MultiRangeDownloader {
         _semaphore = PrioritySemaphore(
           maxInFlightSockets ??
               (concurrency + RangeCore.defaultMaxInFlightExtra),
+          name: 'main',
         ),
         _httpClient = httpClient ??
             (HttpClient()
@@ -308,10 +354,13 @@ class MultiRangeDownloader {
     _probeSemaphore.cancelAll(reason);
   }
 
-  /// 归零调度器状态与信号量
+  /// 归零调度器状态与信号量（R3-B：主信号量与独立探速信号量均推进代际号并归零）
   void reset() {
+    _activeStartupProbeBatches = 0;
     _semaphore.reset();
-    _probeSemaphore.reset();
+    _probeSemaphore
+      ..reset()
+      ..setLimit(RangeCore.startupProbeConcurrency);
   }
 
   /// 单次 piece 下载尝试（包含独立首字节超时 5.5s、停滞 4s、总计 15s）
@@ -326,11 +375,21 @@ class MultiRangeDownloader {
   }) async {
     token.throwIfCancelled();
     final effectiveIsProbe = isProbe || priority >= 200;
-    // 探速/测速使用独立小预算 (_probeSemaphore <= 2)，不与视频 piece 争抢；
-    // 槽位紧张时 piece 永远优先
+    // R3-A（审查 08）：探速/测速始终走独立于视频主池的 _probeSemaphore，不与视频 piece 争抢槽位；
+    // 按 _activeStartupProbeBatches > 0 或 (isProbe && !pool.hasSpeedTested) 区分「启动测速批次（容量 4）」与「稳态探速（容量 2）」
+    final isStartupBatchProbe =
+        _activeStartupProbeBatches > 0 || (isProbe && !pool.hasSpeedTested);
+    if (effectiveIsProbe) {
+      final desiredProbeLimit = isStartupBatchProbe
+          ? RangeCore.startupProbeConcurrency
+          : RangeCore.maxProbeConcurrency;
+      if (_probeSemaphore.limit != desiredProbeLimit) {
+        _probeSemaphore.setLimit(desiredProbeLimit);
+      }
+    }
     final targetSemaphore = effectiveIsProbe ? _probeSemaphore : _semaphore;
     final callerTag = effectiveIsProbe
-        ? 'probe'
+        ? (isStartupBatchProbe ? 'probe_startup' : 'probe_steady')
         : (priority >= 25 ? 'hedge' : 'piece');
     final release = await targetSemaphore.acquire(
       token,
@@ -1194,6 +1253,9 @@ class MultiRangeDownloader {
     int minChunkBytes = RangeCore.defaultMinChunkBytes,
   }) async {
     token.throwIfCancelled();
+    if (pool.adaptiveConcurrency == null && !pool.isSingleConnectionMode) {
+      _pendingStartupEvaluation[pool] = true;
+    }
 
     final candidateUrls = pool.rangeCandidates();
     const probeChunkSize = RangeCore.defaultStartupProbeChunkBytes; // 64 KiB
@@ -1257,170 +1319,191 @@ class MultiRangeDownloader {
     double mainlandMaxBps = 0.0;
     double overseasMaxBps = 0.0;
 
-    for (var batchIndex = 0; batchIndex < batches.length; batchIndex++) {
-      final elapsedMs = probeStopwatch.elapsedMilliseconds;
-      final remainingMs = RangeCore.startupProbeTotalTimeout.inMilliseconds - elapsedMs;
-      if (remainingMs <= 0) {
-        // 整体时间已达上限，超时的批次直接放弃并把该批视为未知，不阻塞起播
-        break;
-      }
-
-      final batch = batches[batchIndex];
-      final batchTimeoutMs = min(remainingMs, RangeCore.startupProbeBatchTimeout.inMilliseconds);
-      final batchCompleter = Completer<void>();
-      final batchToken = CancellationToken();
-      void onParentCancel() {
-        batchToken.cancel(token.reason);
-        if (!batchCompleter.isCompleted) {
-          batchCompleter.complete();
+    _activeStartupProbeBatches++;
+    _probeSemaphore.setLimit(RangeCore.startupProbeConcurrency);
+    try {
+      for (var batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+        final elapsedMs = probeStopwatch.elapsedMilliseconds;
+        final remainingMs =
+            RangeCore.startupProbeTotalTimeout.inMilliseconds - elapsedMs;
+        if (remainingMs <= 0) {
+          // 整体时间已达上限，超时的批次直接放弃并把该批视为未知，不阻塞起播
+          break;
         }
-      }
-      token.addListener(onParentCancel);
 
-      var activeInBatch = batch.urls.length;
-      bool batchTimedOut = false;
-      final batchTimer = Timer(Duration(milliseconds: batchTimeoutMs), () {
-        batchTimedOut = true;
-        batchToken.cancel('启动测速批次超时');
-        if (!batchCompleter.isCompleted) {
-          batchCompleter.complete();
+        final batch = batches[batchIndex];
+        final batchUrls = batch.urls
+            .take(RangeCore.defaultStartupProbeBatchConcurrency)
+            .toList();
+        if (batchUrls.isEmpty) continue;
+        final batchTimeoutMs =
+            min(remainingMs, RangeCore.startupProbeBatchTimeout.inMilliseconds);
+        final batchCompleter = Completer<void>();
+        final batchToken = CancellationToken();
+        void onParentCancel() {
+          batchToken.cancel(token.reason);
+          if (!batchCompleter.isCompleted) {
+            batchCompleter.complete();
+          }
         }
-      });
+        token.addListener(onParentCancel);
 
-      final candidateTimers = <int, Timer>{};
-      for (var i = 0; i < batch.urls.length; i++) {
-        final url = batch.urls[i];
-        triedCandidates.add(url);
-        final childToken = CancellationToken();
-        void onBatchCancel() => childToken.cancel(batchToken.reason);
-        batchToken.addListener(onBatchCancel);
-
-        // 起播交错延迟：[0, 120, 300]ms（对齐官方 idm-downloader.js:315）
-        final staggerDelayMs = (i < RangeCore.startupStaggerDelaysMs.length)
-            ? RangeCore.startupStaggerDelaysMs[i]
-            : RangeCore.startupStaggerDelaysMs.last;
-
-        void launchCandidate() {
-          candidateTimers.remove(i);
-          if (batchToken.isCancelled || childToken.isCancelled) {
-            activeInBatch--;
-            if (activeInBatch <= 0 && !batchCompleter.isCompleted) {
-              batchTimer.cancel();
-              batchCompleter.complete();
-            }
-            return;
+        var activeInBatch = batchUrls.length;
+        bool batchTimedOut = false;
+        final batchTimer = Timer(Duration(milliseconds: batchTimeoutMs), () {
+          batchTimedOut = true;
+          batchToken.cancel('启动测速批次超时');
+          if (!batchCompleter.isCompleted) {
+            batchCompleter.complete();
           }
+        });
 
-          // 槽位紧张时 piece 永远优先，probe 让位（跳过本轮）
-          if (_semaphore.activeCount >= _semaphore.limit || _semaphore.queueLength > 0) {
-            BtrLog.rateLimitedLog(
-              'probe_yield_tight',
-              '[BTR] 槽位紧张: 在途=${_semaphore.activeCount}/${_semaphore.limit} 队列=${_semaphore.queueLength} → 测速让位跳过本轮',
-            );
-            activeInBatch--;
-            if (activeInBatch <= 0 && !batchCompleter.isCompleted) {
-              batchTimer.cancel();
-              batchCompleter.complete();
-            }
-            return;
-          }
+        final candidateTimers = <int, Timer>{};
+        for (var i = 0; i < batchUrls.length; i++) {
+          final url = batchUrls[i];
+          triedCandidates.add(url);
+          final childToken = CancellationToken();
+          void onBatchCancel() => childToken.cancel(batchToken.reason);
+          batchToken.addListener(onBatchCancel);
 
-          attempt(
-            piece: headPiece,
-            url: url,
-            token: childToken,
-            pool: pool,
-            priority: 200,
-            isProbe: true,
-          ).then((res) {
-            batchToken.removeListener(onBatchCancel);
-            if (res.bytes.isEmpty || res.bps <= 0.0) {
-              // 判定：测速未测出，不盲目标记不可用（探速失败 ≠ 节点不可用）
-              results[url] = 0.0;
-            } else {
-              results[url] = res.bps;
-              if (batch.group == CdnGroup.mainland) {
-                if (res.bps > mainlandMaxBps) mainlandMaxBps = res.bps;
-              } else {
-                if (res.bps > overseasMaxBps) overseasMaxBps = res.bps;
-              }
-              if (pool.anchorUrl != null &&
-                  CdnBanList.hostOf(url) == pool.anchorHost) {
-                anchorResult = res;
-              }
-              if (bestResult == null || res.bps > (bestResult?.bps ?? 0.0)) {
-                bestResult = res;
-              }
-              // P1-7: 胜出且拿到数据，取消未发起的交错定时器并扣减计数
-              for (final t in candidateTimers.values) {
-                t.cancel();
-                activeInBatch--;
-              }
-              candidateTimers.clear();
+          // 起播交错延迟：[0, 120, 300]ms（对齐官方 idm-downloader.js:315）
+          final staggerDelayMs = (i < RangeCore.startupStaggerDelaysMs.length)
+              ? RangeCore.startupStaggerDelaysMs[i]
+              : RangeCore.startupStaggerDelaysMs.last;
 
-              // P1-7: 若决出胜者且关键项（如锚点结果）满足，提前取消批次定时器并结束批次，省下 200~240ms
-              final hasAnchorInBatch = pool.anchorUrl != null &&
-                  batch.urls.any((u) => CdnBanList.hostOf(u) == pool.anchorHost);
-              final anchorSatisfied = !hasAnchorInBatch || anchorResult != null;
-              if (bestResult != null && anchorSatisfied && !batchCompleter.isCompleted) {
+          void launchCandidate() {
+            candidateTimers.remove(i);
+            if (batchToken.isCancelled || childToken.isCancelled) {
+              activeInBatch--;
+              if (activeInBatch <= 0 && !batchCompleter.isCompleted) {
                 batchTimer.cancel();
                 batchCompleter.complete();
               }
+              return;
             }
-          }).catchError((err) {
-            batchToken.removeListener(onBatchCancel);
-            results[url] = 0.0;
-            if (batchTimedOut && childToken.isCancelled) {
-              // 因整体/批次超时被放弃的批次：视为未知，不加入不可用集合，不阻塞起播
-            } else {
-              // 判定：测速超时或返回错误 -> 探速失败 ≠ 节点不可用，不盲目标记不可用
-              if (err is! RangeNotSupportedException && err is! TimeoutException) {
-                pool.failure(url, err, isAbort: false);
-              }
-            }
-          }).whenComplete(() {
-            activeInBatch--;
-            if (activeInBatch <= 0 && !batchCompleter.isCompleted) {
-              batchTimer.cancel();
-              batchCompleter.complete();
-            }
-          });
-        }
 
-        if (staggerDelayMs <= 0) {
-          launchCandidate();
-        } else {
-          final t = Timer(Duration(milliseconds: staggerDelayMs), () {
-            if (candidateTimers.containsKey(i)) {
-              candidateTimers.remove(i);
-              if (!batchToken.isCancelled &&
-                  (bestResult == null || anchorResult == null)) {
-                launchCandidate();
+            // 槽位紧张时 piece 永远优先，probe 让位（跳过本轮）
+            if (_semaphore.activeCount >= _semaphore.limit ||
+                _semaphore.queueLength > 0) {
+              BtrLog.rateLimitedLog(
+                'probe_yield_tight',
+                '[BTR] 槽位紧张: 在途=${_semaphore.activeCount}/${_semaphore.limit} 队列=${_semaphore.queueLength} → 测速让位跳过本轮',
+              );
+              activeInBatch--;
+              if (activeInBatch <= 0 && !batchCompleter.isCompleted) {
+                batchTimer.cancel();
+                batchCompleter.complete();
+              }
+              return;
+            }
+
+            attempt(
+              piece: headPiece,
+              url: url,
+              token: childToken,
+              pool: pool,
+              priority: 200,
+              isProbe: true,
+            ).then((res) {
+              batchToken.removeListener(onBatchCancel);
+              if (res.bytes.isEmpty || res.bps <= 0.0) {
+                // 判定：测速未测出，不盲目标记不可用（探速失败 ≠ 节点不可用）
+                results[url] = 0.0;
               } else {
-                activeInBatch--;
-                if (activeInBatch <= 0 && !batchCompleter.isCompleted) {
+                results[url] = res.bps;
+                if (batch.group == CdnGroup.mainland) {
+                  if (res.bps > mainlandMaxBps) mainlandMaxBps = res.bps;
+                } else {
+                  if (res.bps > overseasMaxBps) overseasMaxBps = res.bps;
+                }
+                if (pool.anchorUrl != null &&
+                    CdnBanList.hostOf(url) == pool.anchorHost) {
+                  anchorResult = res;
+                }
+                if (bestResult == null || res.bps > (bestResult?.bps ?? 0.0)) {
+                  bestResult = res;
+                }
+                // P1-7: 胜出且拿到数据，取消未发起的交错定时器并扣减计数
+                for (final t in candidateTimers.values) {
+                  t.cancel();
+                  activeInBatch--;
+                }
+                candidateTimers.clear();
+
+                // P1-7: 若决出胜者且关键项（如锚点结果）满足，提前取消批次定时器并结束批次，省下 200~240ms
+                final hasAnchorInBatch = pool.anchorUrl != null &&
+                    batchUrls.any((u) => CdnBanList.hostOf(u) == pool.anchorHost);
+                final anchorSatisfied = !hasAnchorInBatch || anchorResult != null;
+                if (bestResult != null &&
+                    anchorSatisfied &&
+                    !batchCompleter.isCompleted) {
                   batchTimer.cancel();
                   batchCompleter.complete();
                 }
               }
-            }
-          });
-          candidateTimers[i] = t;
+            }).catchError((err) {
+              batchToken.removeListener(onBatchCancel);
+              results[url] = 0.0;
+              if (batchTimedOut && childToken.isCancelled) {
+                // 因整体/批次超时被放弃的批次：视为未知，不加入不可用集合，不阻塞起播
+              } else {
+                // 判定：测速超时或返回错误 -> 探速失败 ≠ 节点不可用，不盲目标记不可用
+                if (err is! RangeNotSupportedException &&
+                    err is! TimeoutException) {
+                  pool.failure(url, err, isAbort: false);
+                }
+              }
+            }).whenComplete(() {
+              activeInBatch--;
+              if (activeInBatch <= 0 && !batchCompleter.isCompleted) {
+                batchTimer.cancel();
+                batchCompleter.complete();
+              }
+            });
+          }
+
+          if (staggerDelayMs <= 0) {
+            launchCandidate();
+          } else {
+            final t = Timer(Duration(milliseconds: staggerDelayMs), () {
+              if (candidateTimers.containsKey(i)) {
+                candidateTimers.remove(i);
+                if (!batchToken.isCancelled &&
+                    (bestResult == null || anchorResult == null)) {
+                  launchCandidate();
+                } else {
+                  activeInBatch--;
+                  if (activeInBatch <= 0 && !batchCompleter.isCompleted) {
+                    batchTimer.cancel();
+                    batchCompleter.complete();
+                  }
+                }
+              }
+            });
+            candidateTimers[i] = t;
+          }
+        }
+
+        await batchCompleter.future;
+        for (final t in candidateTimers.values) {
+          t.cancel();
+        }
+        candidateTimers.clear();
+        batchTimer.cancel();
+        token.removeListener(onParentCancel);
+
+        // 若已有成功结果且总耗时已满，不再开启下一批
+        if (bestResult != null &&
+            probeStopwatch.elapsedMilliseconds >=
+                RangeCore.startupProbeTotalTimeout.inMilliseconds) {
+          break;
         }
       }
-
-      await batchCompleter.future;
-      for (final t in candidateTimers.values) {
-        t.cancel();
-      }
-      candidateTimers.clear();
-      batchTimer.cancel();
-      token.removeListener(onParentCancel);
-
-      // 若已有成功结果且总耗时已满，不再开启下一批
-      if (bestResult != null &&
-          probeStopwatch.elapsedMilliseconds >= RangeCore.startupProbeTotalTimeout.inMilliseconds) {
-        break;
+    } finally {
+      _activeStartupProbeBatches = max(0, _activeStartupProbeBatches - 1);
+      if (_activeStartupProbeBatches == 0) {
+        // 退出启动测速批次后恢复稳态探速上限（容量 2）
+        _probeSemaphore.setLimit(RangeCore.maxProbeConcurrency);
       }
     }
 
@@ -1531,7 +1614,7 @@ class MultiRangeDownloader {
       token: token,
       winningUrl: winningUrl,
       concurrency: concurrency,
-      maxInFlightSockets: maxInFlightSockets ?? this.maxInFlightSockets,
+      maxInFlightSockets: maxInFlightSockets,
       v1Bps: v1Bps,
       originalThreads: originalThreads,
       kind: kind,
@@ -1594,7 +1677,7 @@ class MultiRangeDownloader {
       token: token,
       winningUrl: probe.winningUrl,
       concurrency: initialConcurrency,
-      maxInFlightSockets: maxInFlightSockets ?? this.maxInFlightSockets,
+      maxInFlightSockets: maxInFlightSockets,
       v1Bps: probe.bps,
       originalThreads: effConcurrency,
       onOrderedChunk: onOrderedChunk,
@@ -1619,10 +1702,19 @@ class _SlidingWindowStreamer {
   final String winningUrl;
   final double v1Bps;
   final int originalThreads;
+  final bool _hasExplicitMaxSockets;
   final int _maxSockets;
   final String kind;
   int limit;
   final Future<void> Function(Uint8List chunk) onOrderedChunk;
+
+  /// 受 maxInFlightSockets、预算划分（originalThreads）与 GlobalSocketBudget（maxGlobalSockets）共同约束的配置并发上限
+  int get _allocatedCap {
+    final int rawCap = _hasExplicitMaxSockets
+        ? min<int>(originalThreads, _maxSockets)
+        : originalThreads;
+    return rawCap.clamp(1, RangeCore.maxGlobalSockets);
+  }
 
   final Map<int, Uint8List> _completedPieces = {};
   final Map<int, Object> _failedPieces = {};
@@ -1644,6 +1736,7 @@ class _SlidingWindowStreamer {
   int _sampleCompleted = 0;
   final int _sampleTarget;
   bool _evaluated = false;
+  bool _singleNotSlowerAtEval = false;
 
   // 聚合吞吐实时追踪（用于判定 hedge 是否允许，任务 A）
   final List<({int timeMs, int bytes})> _recentTransfers = [];
@@ -1688,10 +1781,22 @@ class _SlidingWindowStreamer {
 
   void _rampUpConcurrency({String? reason}) {
     if (kind != 'video') return; // 任务 3：音频轨维持 2 条不要被升档逻辑带上限
+    // R3-C：严格守住单连接模式与对比式判据铁律——单连接模式下绝不升档
+    if (pool.isSingleConnectionMode ||
+        pool.hasStickySingleConnection ||
+        _switchToSingleConnection ||
+        _isDegraded ||
+        pool.isDirectPassthrough) {
+      return;
+    }
     if (_inObserveWindow) return; // 观察期迟滞保护
-    final maxCap = originalThreads.clamp(1, 512);
-    final newLimit = RangeCore.nextConcurrencyTier(limit, maxCap);
-    final oldLimit = limit;
+    final int allocatedCap = _allocatedCap;
+    // R3-C：若最近一次样本评估判定「单连接并不比多连接慢」，一律不许放开升档上限（死守 <= maxRampConcurrency）
+    final int maxCap = _singleNotSlowerAtEval
+        ? min<int>(RangeCore.maxRampConcurrency, allocatedCap)
+        : allocatedCap;
+    final int newLimit = RangeCore.nextConcurrencyTier(limit, maxCap);
+    final int oldLimit = limit;
     _consecutiveHeadHedges = 0;
     _recentHeadHedgeWindow.clear();
     _inObserveWindow = true;
@@ -1704,7 +1809,10 @@ class _SlidingWindowStreamer {
     final triggerReason = reason ?? '滑动窗口计数超限';
     if (newLimit > oldLimit) {
       limit = newLimit;
-      downloader.setConcurrency(newLimit, maxInFlightSockets: _maxSockets);
+      downloader.setConcurrency(
+        newLimit,
+        maxInFlightSockets: _hasExplicitMaxSockets ? _maxSockets : null,
+      );
       pool.adaptiveConcurrency = newLimit;
       pool.updateSlowPieceThreshold(concurrency: newLimit);
       BtrLog.log(
@@ -1773,15 +1881,23 @@ class _SlidingWindowStreamer {
     String? kind,
     required this.onOrderedChunk,
   })  : kind = kind ?? 'stream',
+        _hasExplicitMaxSockets = maxInFlightSockets != null,
         _maxSockets = maxInFlightSockets ?? downloader.maxInFlightSockets,
         originalThreads = originalThreads ?? concurrency,
         limit = (pool.adaptiveConcurrency ??
-                min(concurrency, RangeCore.maxRampConcurrency))
-            .clamp(1, 512),
-        _sampleTarget = min(pieces.length, min(concurrency.clamp(1, 512), 4)) {
+                min<int>(concurrency, RangeCore.maxRampConcurrency))
+            .clamp(1, RangeCore.maxGlobalSockets),
+        _sampleTarget = min<int>(
+          pieces.length,
+          min<int>(concurrency.clamp(1, RangeCore.maxGlobalSockets), 4),
+        ) {
+    final int cap = _allocatedCap;
     if (pool.adaptiveConcurrency != null) {
-      limit = pool.adaptiveConcurrency!.clamp(1, 512);
-      _evaluated = true;
+      limit = pool.adaptiveConcurrency!.clamp(1, cap);
+      // 若仅由起播分档预先写入起手值、尚未完成首次分块样本实测评估，则保持 _evaluated = false
+      _evaluated = _pendingStartupEvaluation[pool] != true;
+    } else {
+      limit = limit.clamp(1, cap);
     }
   }
 
@@ -1809,7 +1925,10 @@ class _SlidingWindowStreamer {
     }
 
     _streamSw.start();
-    downloader.setConcurrency(limit, maxInFlightSockets: _maxSockets);
+    downloader.setConcurrency(
+      limit,
+      maxInFlightSockets: _hasExplicitMaxSockets ? _maxSockets : null,
+    );
     pool.updateSlowPieceThreshold(concurrency: limit);
     if (!_evaluated && _sampleTarget > 0) {
       _sampleSw.start();
@@ -2058,7 +2177,12 @@ class _SlidingWindowStreamer {
       return;
     }
 
-    final maxInFlight = limit + RangeCore.defaultMaxInFlightExtra;
+    final int maxInFlight = _hasExplicitMaxSockets
+        ? min<int>(_maxSockets, limit + RangeCore.defaultMaxInFlightExtra)
+        : min<int>(
+            RangeCore.maxGlobalSockets,
+            limit + RangeCore.defaultMaxInFlightExtra,
+          );
     while (_nextLaunchIndex < pieces.length &&
         _nextLaunchIndex < _nextFlushIndex + limit &&
         _inFlightTokens.length < maxInFlight) {
@@ -2119,6 +2243,7 @@ class _SlidingWindowStreamer {
           _sampleCompleted++;
           if (_sampleCompleted >= _sampleTarget) {
             _evaluated = true;
+            _pendingStartupEvaluation[pool] = null;
             _sampleSw.stop();
             final durationSec =
                 max(0.001, _sampleSw.elapsedMicroseconds / 1000000.0);
@@ -2132,7 +2257,7 @@ class _SlidingWindowStreamer {
 
             // ⚠️ 切单连接的额外前提（否则在网络抽风/样本过短时按噪声切换，
             //    会把多连接的聚合能力白白丢掉，导致视频流停住、音画不同步）：
-            //   ① 单连接自己"够用"（≥ 目标吞吐 = 码率×1.2，或 0.4 MB/s 下限）；
+            //   ① 单连接自己"够用"（≥ 目标吞吐 = 码率×1.5，或 0.4 MB/s 下限）；
             //      **必须与"切回多连接"用同一个函数取值**，否则门限倒挂会反复横跳。
             //   ② 样本足够可信（时长与字节数都够）。
             final targetBps =
@@ -2163,6 +2288,7 @@ class _SlidingWindowStreamer {
 
             if (canSwitchToSingle && pool.tryRecordModeSwitch('多连接')) {
               // 任务 A、B、C、D：并发无收益且单连接不慢于多连接，在满足驻留与频率上限前提下切单连接并启用粘性偏好
+              _singleNotSlowerAtEval = true;
               pool.singleConnectionSwitchCount++;
               BtrLog.rateLimitedLog(
                 'concurrency_no_benefit',
@@ -2176,38 +2302,106 @@ class _SlidingWindowStreamer {
                 ..lastSingleConnectionSpeedBps = v1;
               _switchToSingleConnection = true;
             } else {
-              // ── 并发数反推（小步爬升版，2026-09-20）─────────────────────
-              // 旧逻辑「有收益 → 直接开满 limit」会让单连接只有 0.85 MB/s 的节点也开 32 条。
-              // 新逻辑：按**实测每条连接吞吐**反推"够用就好"的条数，并且**一次最多爬到
-              // maxRampConcurrency（8）**，避免在坏网络里按公式一步顶到配置上限。
-              final sampleConcurrency = max(1, _sampleTarget);
-              final perConnBps = max(
-                aggBps / sampleConcurrency,
+              // ── 并发数反推与 R3-C（审查 V3）动态升档上限放开 ─────────────────
+              // 默认基准上限（原公式）：避免样本不可信或单连接并不更慢时盲目拉高并发；
+              // 当非单连接模式、对比式判据确认「单连接确实慢于多连接」且样本可信时，
+              // maxRampConcurrency(8) 降级为下限保护，按 ceil(targetBps / perConnBps) 动态放开至 allocatedCap。
+              final int sampleConcurrency = max<int>(1, _sampleTarget);
+              final double rawPerConnBps = (aggBps > 0 && aggBps.isFinite)
+                  ? (aggBps / sampleConcurrency)
+                  : 0.0;
+              final double perConnBps = max<double>(
+                rawPerConnBps,
                 RangeCore.minPerConnectionBps,
               );
-              final rampCap = max(
-                sampleConcurrency,
-                min(RangeCore.maxRampConcurrency, sampleConcurrency * 2),
+              final int allocatedCap = _allocatedCap;
+              final int baseRampCap = min<int>(
+                allocatedCap,
+                max<int>(
+                  sampleConcurrency,
+                  min<int>(RangeCore.maxRampConcurrency, sampleConcurrency * 2),
+                ),
               );
-              final neededForTarget =
-                  (targetBps / perConnBps).ceil().clamp(1, rampCap);
+
+              // R3-C 对比式判据铁律：
+              // 1) 处于单连接模式（含粘性单连接、降级透传、本轮即将切单连接）时一律不放开；
+              // 2) 单连接基线未知（<= 0）或单连接并不比多连接慢（>= aggBps × 0.95）时一律不放开；
+              // 3) 音频轨（固定小预算）一律不放开；样本不可信或每连接吞吐为 0 时退回原公式，不许除零。
+              final inSingleConnectionMode = pool.isSingleConnectionMode ||
+                  pool.hasStickySingleConnection ||
+                  _switchToSingleConnection ||
+                  _isDegraded ||
+                  pool.isDirectPassthrough;
+              final singleBaselineBps =
+                  v1 > 0 ? v1 : pool.lastSingleConnectionSpeedBps;
+              final isSingleNotSlower = singleBaselineBps <= 0 ||
+                  singleBaselineBps >= aggBps * RangeCore.singleNotWorseFactor;
+              _singleNotSlowerAtEval = isSingleNotSlower;
+
+              final canRelaxRampCap = kind != 'audio' &&
+                  !inSingleConnectionMode &&
+                  !isSingleNotSlower &&
+                  sampleTrustworthy &&
+                  rawPerConnBps > 0 &&
+                  perConnBps > 0 &&
+                  targetBps > 0 &&
+                  targetBps.isFinite &&
+                  allocatedCap >= RangeCore.maxRampConcurrency;
+
+              final int rampCap;
+              if (canRelaxRampCap) {
+                final int rawNeeded = (targetBps / perConnBps).ceil();
+                rampCap = rawNeeded.clamp(
+                  RangeCore.maxRampConcurrency,
+                  allocatedCap,
+                );
+                if (rampCap > baseRampCap && rawNeeded > baseRampCap) {
+                  final targetMbpsText =
+                      (targetBps / (1024 * 1024)).toStringAsFixed(2);
+                  final perConnMbpsText =
+                      (perConnBps / (1024 * 1024)).toStringAsFixed(2);
+                  BtrLog.rateLimitedLog(
+                    'ramp_cap_relaxed',
+                    '[BTR] 升档上限放开: target=$targetMbpsText MB/s/每连接=$perConnMbpsText MB/s '
+                    '→ rampCap=$rampCap(配置上限=$allocatedCap)',
+                  );
+                }
+              } else {
+                rampCap = baseRampCap;
+              }
+
+              final int effectiveRampCap = max<int>(1, rampCap);
+              final int neededForTarget;
+              if (perConnBps > 0 && targetBps > 0 && targetBps.isFinite) {
+                final int rawTargetNeeded = (targetBps / perConnBps).ceil();
+                neededForTarget = rawTargetNeeded.clamp(1, effectiveRampCap);
+              } else {
+                neededForTarget = min<int>(sampleConcurrency, effectiveRampCap);
+              }
 
               // 任务 2.3：判据边缘（0.9~1.5 倍区间）时倾向多开连接；单连接未达安全倍数或已被推翻乐观估计时绝不降为 2
               final isSingleFast = v1 >= targetBps * 1.5 &&
                   v1 >= RangeCore.fastNodeBpsThreshold;
-              final decidedConcurrency = (hasBenefit ||
+              final int rawDecidedConcurrency = (hasBenefit ||
                       !isSingleFast ||
                       pool.isOptimisticEstimateInvalid ||
                       _inObserveWindow)
-                  ? max(neededForTarget, min(RangeCore.maxRampConcurrency, limit))
-                  : min(RangeCore.fastNodeConcurrency, limit);
+                  ? max<int>(
+                      neededForTarget,
+                      min<int>(RangeCore.maxRampConcurrency, limit),
+                    )
+                  : min<int>(RangeCore.fastNodeConcurrency, limit);
+              final int decidedConcurrency =
+                  rawDecidedConcurrency.clamp(1, allocatedCap);
 
+              final int oldLimit = limit;
               pool.adaptiveConcurrency = decidedConcurrency;
-              if (decidedConcurrency != limit) {
+              if (decidedConcurrency != oldLimit) {
                 limit = decidedConcurrency;
                 downloader.setConcurrency(
                   decidedConcurrency,
-                  maxInFlightSockets: _maxSockets,
+                  maxInFlightSockets:
+                      _hasExplicitMaxSockets ? _maxSockets : null,
                 );
               }
 
@@ -2228,8 +2422,12 @@ class _SlidingWindowStreamer {
                 'hedge=${hedgeAllowed ? "允许" : "跳过"}, '
                 '最终并发=$decidedConcurrency, '
                 '慢块阈值=${pool.slowPieceThreshold.inMilliseconds}ms '
-                '(配置上限=$originalThreads)',
+                '(配置上限=$allocatedCap)',
               );
+
+              if (decidedConcurrency > oldLimit) {
+                _launchNext();
+              }
             }
           }
         }
@@ -2491,8 +2689,8 @@ class _SlidingWindowStreamer {
                 token: token,
                 winningUrl: winningUrl,
                 concurrency: originalThreads,
-                maxInFlightSockets: _maxSockets,
-                v1Bps: 0.0,
+                maxInFlightSockets: _hasExplicitMaxSockets ? _maxSockets : null,
+                v1Bps: pool.lastSingleConnectionSpeedBps,
                 originalThreads: originalThreads,
                 kind: kind,
                 onOrderedChunk: onOrderedChunk,

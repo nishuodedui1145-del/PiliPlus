@@ -82,6 +82,39 @@ class UpstreamHttpException implements Exception {
 
 /// BTR 核心 Range 解析、切分与校验逻辑
 abstract final class RangeCore {
+  /// 官方大陆 CDN 节点单点维护集合（18 个，CdnPool 与 CdnRacer 共用）
+  static const Set<String> mainlandHosts = {
+    'upos-sz-mirrorali.bilivideo.com',
+    'upos-sz-mirrorhw.bilivideo.com',
+    'upos-sz-mirrorbos.bilivideo.com',
+    'upos-sz-mirror08c.bilivideo.com',
+    'upos-sz-mirrorbd.bilivideo.com',
+    'upos-sz-mirror14b.bilivideo.com',
+    'upos-sz-estgoss.bilivideo.com',
+    'upos-sz-mirrorcos.bilivideo.com',
+    'upos-sz-mirroralib.bilivideo.com',
+    'upos-sz-mirroralio1.bilivideo.com',
+    'upos-sz-mirrorcosb.bilivideo.com',
+    'upos-sz-mirrorcoso1.bilivideo.com',
+    'upos-sz-mirrorhwb.bilivideo.com',
+    'upos-sz-mirrorhwo1.bilivideo.com',
+    'upos-sz-mirror08h.bilivideo.com',
+    'upos-sz-mirror08ct.bilivideo.com',
+    'upos-tf-all-hw.bilivideo.com',
+    'upos-tf-all-tx.bilivideo.com',
+  };
+
+  /// 官方海外 CDN 节点单点维护集合（7 个，含 Akamai 海外节点，CdnPool 与 CdnRacer 共用）
+  static const Set<String> overseasHosts = {
+    'upos-sz-mirrorcosov.bilivideo.com',
+    'upos-sz-mirroraliov.bilivideo.com',
+    'cn-hk-eq-01-01.bilivideo.com',
+    'cn-hk-eq-01-03.bilivideo.com',
+    'upos-sz-mirrorhwov.bilivideo.com',
+    'cn-hk-eq-bcache-01.bilivideo.com',
+    'upos-hz-mirrorakam.akamaized.net',
+  };
+
   static const int defaultConcurrency = 8;
   static const int defaultMinChunkBytes = 64 * 1024; // 64 KiB
 
@@ -109,8 +142,11 @@ abstract final class RangeCore {
   /// 全局并发预算上限（防止极端配置耗尽系统文件描述符）
   static const int maxGlobalSockets = 64;
 
-  /// 探速/测速独立小预算并发上限（建议并发 <= 2，不与视频 piece 争抢）
+  /// 稳态探速/测速独立小预算并发上限（非启动批次探速并发 <= 2，不与视频 piece 争抢）
   static const int maxProbeConcurrency = 2;
+
+  /// 启动测速批次独立探速池并发上限（R3-A：单批最多 4 候选真正并发测速，独立于视频池，不与视频 piece 争抢）
+  static const int startupProbeConcurrency = 4;
 
   /// 计算官方并发预算分配（对齐官方 idm-downloader.js:313-318 / 387-392）：
   /// - 视频侧预算不得低于下限（8），且受全局上限（64）约束，不再出现「视频=4 / 全局=7」
@@ -218,13 +254,17 @@ abstract final class RangeCore {
   /// 单条连接吞吐的下限（32 KB/s）；用于避免 perConn 过小导致反推出荒唐的并发数
   static const double minPerConnectionBps = 32.0 * 1024;
 
-  /// 并发"小步爬升"上限：一次评估最多把并发提到这么多条
-  /// （避免在坏网络里按反推公式一步顶到配置上限，如 32 条——真机 04:06 日志那种）
+  /// 并发爬升默认基准上限 / 动态放开时的下限保护（R3-C）：
+  /// 样本不可信或未通过对比式判据时作为爬升上限（避免坏网络一步顶满配置上限）；
+  /// 多连接明显快于单连接且样本可信时降级为 rampCap 下限保护（受 allocatedThreads 与预算硬上限约束）。
   static const int maxRampConcurrency = 8;
 
   /// 切回多连接时的迟滞系数：单连接速度低于「目标 × 该系数（0.8）」才考虑解粘，
   /// 与切入判据（≥ 目标）拉开 20% 死区，防止在两者之间反复横跳。
   static const double switchBackMargin = 0.8;
+
+  /// 紧急解粘逃生系数：单连接实测低于「目标 × 该系数（0.7）」时允许突破 20 秒最小驻留立即解粘
+  static const double emergencySwitchBackMargin = 0.7;
 
   /// 切入单连接硬条件容差：单连接吞吐必须 >= 多连接聚合吞吐 × 该系数（0.95）
   static const double singleNotWorseFactor = 0.95;
@@ -343,8 +383,8 @@ abstract final class RangeCore {
   /// 启动测速候选节点数总量上限（回退到第十一轮的 4 个候选）
   static const int defaultStartupProbeCandidateCount = 4;
 
-  /// 启动测速每批最大并发路数（对齐 maxProbeConcurrency: 最多 2 路并发，不与视频 piece 争抢）
-  static const int defaultStartupProbeBatchConcurrency = maxProbeConcurrency;
+  /// 启动测速每批最大并发路数（R3-A：对齐 startupProbeConcurrency = 4，与独立探速池容量一致）
+  static const int defaultStartupProbeBatchConcurrency = startupProbeConcurrency;
 
   /// 启动测速分块大小（64 KiB：必须在 0.5 秒预算内测得出速度，
   /// 用 256KB 样本在慢节点上会全部超时 -> 等于没测，真机 04:06 日志已确认）

@@ -1,3 +1,4 @@
+import 'dart:collection';
 import 'dart:math';
 
 
@@ -31,22 +32,24 @@ const int kStickyDecayPeakDurationMs = 10000;
 
 /// 负责记录并封禁坏节点（对齐官方 cdn-resolver.js:125-146 node / address / pair 三级封禁）
 class CdnBanList {
+  /// 端点级（address / pair 合并存储）容量上限，超限按插入顺序淘汰最老条目（R4-A）
+  static const int maxEndpointEntries = 200;
+
   final int strikeLimit;
   final Map<String, int> _strikes = {};
   final Set<String> _banned = {};
 
-  final Map<String, int> _addressStrikes = {};
-  final Set<String> _addressBanned = {};
-
-  final Map<String, int> _pairStrikes = {};
-  final Set<String> _pairBanned = {};
+  /// R4-B：addressOf 与 pairOf 现均返回 "$host|$path"，内部合并为同一套有序存储，两个公开方法均保留
+  final LinkedHashMap<String, int> _addressStrikes =
+      LinkedHashMap<String, int>();
+  final LinkedHashSet<String> _addressBanned = LinkedHashSet<String>();
 
   CdnBanList({this.strikeLimit = 2});
 
   /// 三级封禁语义定义（P0-3）：
   /// 1. host: 整个域名（如 mirrorali.bilivideo.com）。当发生连接重置/连续超时等物理网络故障时封禁整个域名。
   /// 2. address: 具体节点端点，组合为 "$host|$path"。当该节点对特定资源鉴权失败（403/404/410）时，只封禁此具体端点，同 path 的其它 host 镜像不受影响。
-  /// 3. pair: 需与 host 绑定的路径组合键（"$host|$path"），与 address 粒度对齐，用于配对失效记录。
+  /// 3. pair: 需与 host 绑定的路径组合键（"$host|$path"），与 address 粒度对齐，用于配对失效记录（R4-B 内部与 address 共用同一套存储）。
   static String hostOf(String url) {
     try {
       return Uri.parse(url).host.toLowerCase();
@@ -67,15 +70,25 @@ class CdnBanList {
     }
   }
 
-  static String pairOf(String url) {
-    try {
-      final uri = Uri.parse(url);
-      final host = uri.host.toLowerCase();
-      final path = uri.path.toLowerCase();
-      if (host.isEmpty || path.isEmpty) return '';
-      return '$host|$path';
-    } catch (_) {
-      return '';
+  static String pairOf(String url) => addressOf(url);
+
+  /// 记录一次端点（address / pair 合并键）strike，超 200 条淘汰最老条目，不改变三级封禁判据语义
+  void _recordEndpointStrike(String endpoint) {
+    if (endpoint.isEmpty || _addressBanned.contains(endpoint)) return;
+    if (!_addressStrikes.containsKey(endpoint)) {
+      while (_addressStrikes.length >= maxEndpointEntries) {
+        _addressStrikes.remove(_addressStrikes.keys.first);
+      }
+    }
+    final c = (_addressStrikes[endpoint] ?? 0) + 1;
+    _addressStrikes[endpoint] = c;
+    if (c >= strikeLimit) {
+      while (_addressBanned.length >= maxEndpointEntries) {
+        final oldest = _addressBanned.first;
+        _addressBanned.remove(oldest);
+        _addressStrikes.remove(oldest);
+      }
+      _addressBanned.add(endpoint);
     }
   }
 
@@ -85,36 +98,17 @@ class CdnBanList {
 
     final host = hostOf(url);
     final address = addressOf(url);
-    final pair = pairOf(url);
 
     // 官方规范：某个下载地址一直被服务器拒绝（如 403 / 404 / 410），只停用这个地址与 pair，不连累节点 strike
     if (error is UpstreamHttpException &&
         (error.statusCode == 403 ||
             error.statusCode == 404 ||
             error.statusCode == 410)) {
-      if (address.isNotEmpty && !_addressBanned.contains(address)) {
-        final c = (_addressStrikes[address] ?? 0) + 1;
-        _addressStrikes[address] = c;
-        if (c >= strikeLimit) _addressBanned.add(address);
-      }
-      if (pair.isNotEmpty && !_pairBanned.contains(pair)) {
-        final c = (_pairStrikes[pair] ?? 0) + 1;
-        _pairStrikes[pair] = c;
-        if (c >= strikeLimit) _pairBanned.add(pair);
-      }
+      _recordEndpointStrike(address);
       return false;
     }
 
-    if (address.isNotEmpty && !_addressBanned.contains(address)) {
-      final c = (_addressStrikes[address] ?? 0) + 1;
-      _addressStrikes[address] = c;
-      if (c >= strikeLimit) _addressBanned.add(address);
-    }
-    if (pair.isNotEmpty && !_pairBanned.contains(pair)) {
-      final c = (_pairStrikes[pair] ?? 0) + 1;
-      _pairStrikes[pair] = c;
-      if (c >= strikeLimit) _pairBanned.add(pair);
-    }
+    _recordEndpointStrike(address);
 
     if (host.isEmpty || _banned.contains(host)) return false;
 
@@ -132,22 +126,18 @@ class CdnBanList {
     if (host.isNotEmpty && _banned.contains(host)) return false;
     final address = addressOf(url);
     if (address.isNotEmpty && _addressBanned.contains(address)) return false;
-    final pair = pairOf(url);
-    if (pair.isNotEmpty && _pairBanned.contains(pair)) return false;
     return true;
   }
 
   List<String> get bannedHosts => _banned.toList();
   List<String> get bannedAddresses => _addressBanned.toList();
-  List<String> get bannedPairs => _pairBanned.toList();
+  List<String> get bannedPairs => _addressBanned.toList();
 
   void reset() {
     _strikes.clear();
     _banned.clear();
     _addressStrikes.clear();
     _addressBanned.clear();
-    _pairStrikes.clear();
-    _pairBanned.clear();
   }
 }
 
@@ -159,25 +149,11 @@ enum CdnGroup {
 
 /// CDN 节点池与调度器（对应 BTR 的 cdn-resolver.js）
 class CdnPool {
-  /// 官方大陆节点清单（8 个，来自 MrTangLuyao/Bilibili-thread-ripper cdn-resolver.js）
-  static const List<String> mainlandHosts = [
-    'upos-sz-mirrorali.bilivideo.com',
-    'upos-sz-mirrorhw.bilivideo.com',
-    'upos-sz-mirrorbos.bilivideo.com',
-    'upos-sz-mirror08c.bilivideo.com',
-    'upos-sz-mirrorbd.bilivideo.com',
-    'upos-sz-mirror14b.bilivideo.com',
-    'upos-sz-estgoss.bilivideo.com',
-    'upos-sz-mirrorcos.bilivideo.com',
-  ];
+  /// 官方大陆节点清单（单点维护于 RangeCore.mainlandHosts，保留 List 类型兼容外部调用）
+  static List<String> get mainlandHosts => RangeCore.mainlandHosts.toList();
 
-  /// 官方海外节点清单（4 个，来自 MrTangLuyao/Bilibili-thread-ripper cdn-resolver.js）
-  static const List<String> overseasHosts = [
-    'upos-sz-mirrorcosov.bilivideo.com',
-    'upos-sz-mirroraliov.bilivideo.com',
-    'cn-hk-eq-01-01.bilivideo.com',
-    'cn-hk-eq-01-03.bilivideo.com',
-  ];
+  /// 官方海外节点清单（单点维护于 RangeCore.overseasHosts，保留 List 类型兼容外部调用）
+  static List<String> get overseasHosts => RangeCore.overseasHosts.toList();
 
   final List<String> originalUrls;
   final CdnBanList banList;
@@ -210,7 +186,18 @@ class CdnPool {
   late final List<String> _allFallbackUrls;
 
   /// 本次播放自适应决策得出的最优并发数（同一视频生命周期内保持）
-  int? adaptiveConcurrency;
+  int? _adaptiveConcurrency;
+
+  /// 最近一次已知有效并发数（跨 reset 保留，防止慢块阈值被 reset 打回默认 1200ms）
+  int? _lastKnownConcurrency;
+
+  int? get adaptiveConcurrency => _adaptiveConcurrency;
+  set adaptiveConcurrency(int? value) {
+    _adaptiveConcurrency = value;
+    if (value != null && value > 0) {
+      _lastKnownConcurrency = value;
+    }
+  }
 
   /// 标记乐观估计是否已被推翻（例如因队头反复饿死对冲触发自纠正，对齐任务 1.2）
   bool isOptimisticEstimateInvalid = false;
@@ -271,34 +258,67 @@ class CdnPool {
   /// 同一视频每分钟最多模式切换次数（2 次）
   static const int kMaxModeSwitchesPerMinute = 2;
 
-  /// 检查并记录一次模式切换（任务 C）。
+  /// 检查并记录一次模式切换（任务 C & R2-D）。
   /// 1. 每次模式切换（切入单连接 / 解粘切回多连接）后，最少驻留 20 秒才允许再次切换；
-  /// 2. 同一视频每分钟最多 2 次模式切换；超限则保持当前模式并记限速日志：
+  ///    R2-D 紧急逃生：仅对解粘（单连接 → 多连接），当单连接实测速率 < targetBps × 0.7 时允许跳过最小驻留；
+  /// 2. 同一视频每分钟最多 2 次模式切换（紧急解粘亦严格受此上限约束）；超限则保持当前模式并记限速日志：
   ///    `[BTR] 模式切换受限（本分钟已达上限），保持当前模式=X`。
-  bool tryRecordModeSwitch(String currentMode) {
+  bool tryRecordModeSwitch(
+    String currentMode, {
+    double? singleConnectionBps,
+    double? targetBps,
+  }) {
     final now = DateTime.now().millisecondsSinceEpoch;
     _modeSwitchTimestamps.removeWhere((t) => now - t > 60000);
 
-    // 1. 每次模式切换后最少驻留 20 秒
+    final effectiveTargetBps = (targetBps != null && targetBps > 0)
+        ? targetBps
+        : RangeCore.requiredThroughputBytesPerSec(videoBitrateBytesPerSec);
+    final emergencyThresholdBps =
+        effectiveTargetBps * RangeCore.emergencySwitchBackMargin;
+    final measuredSingleBps = singleConnectionBps ??
+        (lastSingleConnectionSpeedBps > 0
+            ? lastSingleConnectionSpeedBps
+            : null);
+
+    double? bypassedSingleBps;
+
+    // 1. 每次模式切换后最少驻留 20 秒（解粘且实测 < targetBps × 0.7 时允许突破最小驻留）
     if (_modeSwitchTimestamps.isNotEmpty) {
       final lastSwitch = _modeSwitchTimestamps.last;
       final elapsed = now - lastSwitch;
       if (elapsed < kMinModeDwellMs) {
-        BtrLog.rateLimitedLog(
-          'mode_switch_dwell_limit',
-          '[BTR] 模式切换受限（驻留未满 20 秒），保持当前模式=$currentMode',
-        );
-        return false;
+        if (currentMode == '单连接' &&
+            measuredSingleBps != null &&
+            measuredSingleBps < emergencyThresholdBps) {
+          bypassedSingleBps = measuredSingleBps;
+        } else {
+          BtrLog.rateLimitedLog(
+            'mode_switch_dwell_limit',
+            '[BTR] 模式切换受限（驻留未满 20 秒），保持当前模式=$currentMode',
+          );
+          return false;
+        }
       }
     }
 
-    // 2. 每分钟最多 2 次模式切换
+    // 2. 每分钟最多 2 次模式切换（防止乒乓切换，不许放开）
     if (_modeSwitchTimestamps.length >= kMaxModeSwitchesPerMinute) {
       BtrLog.rateLimitedLog(
         'mode_switch_rate_limit',
         '[BTR] 模式切换受限（本分钟已达上限），保持当前模式=$currentMode',
       );
       return false;
+    }
+
+    if (bypassedSingleBps != null) {
+      final curMbps = (bypassedSingleBps / (1024 * 1024)).toStringAsFixed(2);
+      final emergencyMbps =
+          (emergencyThresholdBps / (1024 * 1024)).toStringAsFixed(2);
+      BtrLog.rateLimitedLog(
+        'emergency_sticky_release',
+        '[BTR] 紧急解粘（单连接=$curMbps MB/s < 目标×0.7=$emergencyMbps MB/s，跳过最小驻留）',
+      );
     }
 
     _modeSwitchTimestamps.add(now);
@@ -346,7 +366,10 @@ class CdnPool {
       return false;
     }
 
-    final threshold = targetBps * RangeCore.switchBackMargin;
+    final effectiveTargetBps = targetBps > 0
+        ? targetBps
+        : RangeCore.requiredThroughputBytesPerSec(videoBitrateBytesPerSec);
+    final threshold = effectiveTargetBps * RangeCore.switchBackMargin;
     final isSubstandard = currentBps < threshold;
     final isMultiBetter =
         multiBpsAtSwitch > currentBps * RangeCore.switchBackMultiBetterFactor;
@@ -354,8 +377,12 @@ class CdnPool {
     if (isSubstandard && isMultiBetter) {
       _consecutiveSubstandardIntervals++;
       if (_consecutiveSubstandardIntervals >= 3) {
-        // 任务 C：模式切换频率与驻留时间硬约束
-        if (!tryRecordModeSwitch('单连接')) {
+        // 任务 C & R2-D：模式切换频率与驻留硬约束（单连接实测 < targetBps × 0.7 时允许突破 20s 最小驻留）
+        if (!tryRecordModeSwitch(
+          '单连接',
+          singleConnectionBps: currentBps,
+          targetBps: effectiveTargetBps,
+        )) {
           return false;
         }
         stickyReleaseCount++;
@@ -520,9 +547,8 @@ class CdnPool {
     if (g == null) return false;
     final host = CdnBanList.hostOf(url);
     if (host.isEmpty) return false;
-    return g == CdnGroup.overseas
-        ? !overseasHosts.contains(host)
-        : overseasHosts.contains(host);
+    final isOverseas = _isOverseasHost(host);
+    return g == CdnGroup.overseas ? !isOverseas : isOverseas;
   }
 
   void applyRacerHint(String host, double bytesPerSec) {
@@ -605,6 +631,9 @@ class CdnPool {
     double? targetBps,
     int pieceBytes = RangeCore.defaultMaxPieceBytes,
   }) {
+    if (concurrency > 0) {
+      _lastKnownConcurrency = concurrency;
+    }
     slowPieceThreshold = RangeCore.adaptiveSlowPieceThreshold(
       videoBitrateBytesPerSec,
       targetBps: targetBps,
@@ -625,7 +654,7 @@ class CdnPool {
   /// 起播测速时大陆组候选（最多 4 个）
   List<String> get mainlandProbeCandidates {
     final list = <String>[
-      if (anchorUrl != null && !overseasHosts.contains(anchorHost)) anchorUrl!,
+      if (anchorUrl != null && !_isOverseasHost(anchorHost)) anchorUrl!,
       ..._mainlandCandidateUrls,
     ];
     final seen = <String>{};
@@ -635,7 +664,7 @@ class CdnPool {
   /// 起播测速时海外组候选（最多 4 个）
   List<String> get overseasProbeCandidates {
     final list = <String>[
-      if (anchorUrl != null && overseasHosts.contains(anchorHost)) anchorUrl!,
+      if (anchorUrl != null && _isOverseasHost(anchorHost)) anchorUrl!,
       ..._overseasCandidateUrls,
     ];
     final seen = <String>{};
@@ -672,7 +701,7 @@ class CdnPool {
     }
     slowPieceThreshold = RangeCore.adaptiveSlowPieceThreshold(
       videoBitrateBytesPerSec,
-      concurrency: null,
+      concurrency: _lastKnownConcurrency,
     );
     _logBitrateParsing();
     _initCandidatePools();
@@ -824,8 +853,19 @@ class CdnPool {
   double? getSpeed(String url) => _health[url]?.bps;
 
   static bool isAkamaiHost(String host) {
-    final lower = host.toLowerCase();
+    final lower = host.contains(':')
+        ? host.split(':').first.toLowerCase()
+        : host.toLowerCase();
     return lower == 'akamaized.net' || lower.endsWith('.akamaized.net');
+  }
+
+  /// 判断 host 是否属于海外节点（含 RangeCore.overseasHosts 与所有 Akamai 域名，不落入大陆判定）
+  static bool _isOverseasHost(String? host) {
+    if (host == null || host.isEmpty) return false;
+    final lower = host.contains(':')
+        ? host.split(':').first.toLowerCase()
+        : host.toLowerCase();
+    return RangeCore.overseasHosts.contains(lower) || isAkamaiHost(lower);
   }
 
   static bool isAkamaiUrl(String url) {
@@ -851,9 +891,9 @@ class CdnPool {
       if (u == null || u.isEmpty) return;
       if (!RangeCore.isBilibiliMediaUrl(u)) return;
       final host = CdnBanList.hostOf(u);
-      if (mainlandHosts.contains(host)) {
+      if (RangeCore.mainlandHosts.contains(host)) {
         if (seenMainland.add(u)) mainlandList.add(u);
-      } else if (overseasHosts.contains(host)) {
+      } else if (_isOverseasHost(host)) {
         if (seenOverseas.add(u)) overseasList.add(u);
       } else {
         if (seenAnchor.add(u)) anchorList.add(u);
@@ -875,14 +915,16 @@ class CdnPool {
       try {
         final donorUri = Uri.parse(donor);
         final defaultPort = donorUri.scheme == 'http' ? 80 : 443;
-        for (final host in mainlandHosts) {
+        for (final host in RangeCore.mainlandHosts) {
           final synthetic =
               donorUri.replace(host: host, port: defaultPort).toString();
           if (RangeCore.isBilibiliMediaUrl(synthetic) && seenMainland.add(synthetic)) {
             mainlandList.add(synthetic);
           }
         }
-        for (final host in overseasHosts) {
+        for (final host in RangeCore.overseasHosts) {
+          // Akamai 鉴权格式与 upos 镜像不兼容，替换 host 合成必然 403，跳过合成（原始 Akamai URL 已在步骤 1 归入海外组）
+          if (isAkamaiHost(host)) continue;
           final synthetic =
               donorUri.replace(host: host, port: defaultPort).toString();
           if (RangeCore.isBilibiliMediaUrl(synthetic) && seenOverseas.add(synthetic)) {
@@ -985,9 +1027,10 @@ class CdnPool {
     if (_groupDecided) {
       final host = anchorHost;
       final belongsToActiveGroup = host != null &&
+          host.isNotEmpty &&
           (_activeGroup == CdnGroup.overseas
-              ? overseasHosts.contains(host)
-              : !overseasHosts.contains(host));
+              ? _isOverseasHost(host)
+              : !_isOverseasHost(host));
       if (!belongsToActiveGroup) {
         return list;
       }
@@ -1074,7 +1117,9 @@ class CdnPool {
 
   /// 为 pieceIndex 选择候选节点列表：
   /// 1. 锚点优先：若锚点未被拉黑且实测速度不低于码率 × 1.2，优先分派给锚点
-  /// 2. 锚点降级时：从可用节点里按实测速度加权选择首选节点，快的多分块，其余按速度降序排列作为备选与重试候选
+  /// 2. 粘性优先：锚点不达标时，若粘性节点有效、在候选池内且不与手选分组冲突，放到候选首位
+  /// 3. 竞速提示：若有有效 racerHint 且非已失效粘性节点，放到候选首位
+  /// 4. 加权兜底：从可用节点里按实测速度加权选择首选节点，其余按速度降序排列作为备选与重试候选
   List<String> ordered(int pieceIndex, {Set<String>? exclude}) {
     final now = DateTime.now().millisecondsSinceEpoch;
     final candidates = urls()
@@ -1096,9 +1141,21 @@ class CdnPool {
 
     if (pool.length <= 1) return pool;
 
-    // 2. 锚点不达标时，若有 racerHint，将 racerHint 节点排到最前
+    // 2. 粘性优先：粘性节点有效、在候选池内且不与用户手选分组冲突时放到候选首位
+    final sticky = _stickyUrl;
+    if (sticky != null &&
+        pool.contains(sticky) &&
+        isStickyValid(sticky) &&
+        !_conflictsServedGroup(sticky)) {
+      final others = pool.where((u) => u != sticky).toList()
+        ..sort((a, b) => (_health[b]?.bps ?? 0.0).compareTo(_health[a]?.bps ?? 0.0));
+      return [sticky, ...others];
+    }
+
+    // 3. 锚点与粘性均未命中时，若有有效 racerHint（且非刚失效的粘性节点），排到最前
     final hint = _racerHintUrl;
     if (hint != null &&
+        hint != sticky &&
         pool.contains(hint) &&
         isUsable(hint) &&
         !_conflictsServedGroup(hint) &&
@@ -1108,7 +1165,7 @@ class CdnPool {
       return [hint, ...others];
     }
 
-    // 3. 按实测速度加权分配首选节点，其余候选按速度降序作为备选与重试候选
+    // 4. 按实测速度加权分配首选节点，其余候选按速度降序作为备选与重试候选
     final selected = pickWeightedCandidate(pool);
     final others = pool.where((u) => u != selected).toList()
       ..sort((a, b) => (_health[b]?.bps ?? 0.0).compareTo(_health[a]?.bps ?? 0.0));
@@ -1270,7 +1327,7 @@ class CdnPool {
             : null);
     slowPieceThreshold = RangeCore.adaptiveSlowPieceThreshold(
       videoBitrateBytesPerSec,
-      concurrency: null,
+      concurrency: _lastKnownConcurrency,
     );
     isDirectPassthrough = false;
     retakeoverAttempts = 0;

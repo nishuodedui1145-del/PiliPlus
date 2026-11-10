@@ -880,7 +880,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     return player;
   }
 
-  late final buffer = Pref.initBuffer(_playbackSpeed.value);
+  // R5-A：BTR 开启时自动注入抬高后的 mpv 缓冲参数，关闭时保持原样；用 getter 使快捷面板切换重载即时生效
+  Map<String, String> get buffer => Pref.btrEnabled
+      ? Pref.initBtrBuffer(_playbackSpeed.value)
+      : Pref.initBuffer(_playbackSpeed.value);
   late final liveBuffer = Pref.initLiveBuffer();
 
   // 配置播放器
@@ -981,6 +984,16 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   List<StreamSubscription>? _subscriptions;
   final Set<ValueChanged<Duration>> _positionListeners = {};
   final Set<ValueChanged<PlayerStatus>> _statusListeners = {};
+  final Set<ValueChanged<Duration>> _seekListeners = {};
+
+  void _notifySeekListeners(Duration position) {
+    if (isLive || isFileSource || _seekListeners.isEmpty) {
+      return;
+    }
+    for (final element in List.of(_seekListeners)) {
+      element(position);
+    }
+  }
 
   Timer? _wakeLockTimer;
 
@@ -1183,6 +1196,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       await _videoPlayerController?.stream.buffer.first;
     }
     danmakuController?.clear();
+    _notifySeekListeners(position);
     try {
       await _videoPlayerController?.seek(position);
       _updateIOSPip(position);
@@ -1393,6 +1407,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   // 双击播放、暂停
   Future<void> onDoubleTapCenter() async {
     if (!isLive && isCompleted) {
+      _notifySeekListeners(Duration.zero);
       await videoPlayerController!.seek(Duration.zero);
       videoPlayerController!.play();
     } else {
@@ -1558,6 +1573,14 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   void removeStatusLister(ValueChanged<PlayerStatus> listener) =>
       _statusListeners.remove(listener);
 
+  void addSeekListener(ValueChanged<Duration> listener) {
+    if (_playerCount == 0) return;
+    _seekListeners.add(listener);
+  }
+
+  void removeSeekListener(ValueChanged<Duration> listener) =>
+      _seekListeners.remove(listener);
+
   // 记录播放记录
   Future<void>? makeHeartBeat(
     int progress, {
@@ -1696,6 +1719,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _removeListeners();
     _positionListeners.clear();
     _statusListeners.clear();
+    _seekListeners.clear();
     _stopWakeLockTimer();
     WakelockPlus.disable();
     if (kDebugMode) {

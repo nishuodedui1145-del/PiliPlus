@@ -1,3 +1,4 @@
+import 'dart:collection';
 import 'dart:math';
 import 'dart:typed_data';
 
@@ -50,10 +51,12 @@ class _SidxCacheEntry {
   _SidxCacheEntry(this.result, this.timestamp);
 }
 
-/// SIDX 缓存，按 URL path 作为 key
+/// SIDX 缓存，按 URL path 作为 key（R4-A：LRU 容量上限 50 条，put/get 均维持最近使用顺序）
 class SidxCache {
-  static final Map<String, _SidxCacheEntry> _cache = {};
+  static final LinkedHashMap<String, _SidxCacheEntry> _cache =
+      LinkedHashMap<String, _SidxCacheEntry>();
   static const int _ttlMs = 600000; // 10分钟
+  static const int maxEntries = 50;
 
   /// 提取 URL 中的 path 作为缓存 Key，去除参数和签名信息
   static String urlToKey(String url) {
@@ -69,25 +72,30 @@ class SidxCache {
     }
   }
 
-  /// 获取缓存，过期则返回 null 并清除
+  /// 获取缓存：过期则清除并返回 null；命中则移至队尾（更新为最近使用）
   static SidxResult? get(String urlKey) {
-    final entry = _cache[urlKey];
+    final entry = _cache.remove(urlKey);
     if (entry == null) return null;
-    
+
     final now = DateTime.now().millisecondsSinceEpoch;
     if (now - entry.timestamp > _ttlMs) {
-      _cache.remove(urlKey);
       return null;
     }
+    _cache[urlKey] = entry;
     return entry.result;
   }
 
-  /// 存入缓存
+  /// 存入缓存：维持最近使用顺序，超限时优先清理已过期条目，仍超限则淘汰最久未用条目
   static void put(String urlKey, SidxResult result) {
-    _cache[urlKey] = _SidxCacheEntry(
-      result,
-      DateTime.now().millisecondsSinceEpoch,
-    );
+    final now = DateTime.now().millisecondsSinceEpoch;
+    _cache.remove(urlKey);
+    if (_cache.length >= maxEntries) {
+      _cache.removeWhere((_, v) => now - v.timestamp > _ttlMs);
+      while (_cache.length >= maxEntries) {
+        _cache.remove(_cache.keys.first);
+      }
+    }
+    _cache[urlKey] = _SidxCacheEntry(result, now);
   }
 
   /// 失效特定缓存

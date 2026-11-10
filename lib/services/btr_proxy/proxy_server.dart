@@ -43,6 +43,19 @@ class GlobalSocketBudget {
   }
 }
 
+/// R5-B：承载单轮探测或分块调度的 seek 取消句柄（与请求级 CancellationToken 解耦）
+class _SeekRoundHandle {
+  final CancellationToken token = CancellationToken();
+  bool abortedBySeek = false;
+
+  void cancelForSeek() {
+    if (!token.isCancelled) {
+      abortedBySeek = true;
+      token.cancel('Client seek');
+    }
+  }
+}
+
 /// 本地 BTR HTTP 代理服务器
 class BtrProxyServer {
   static final BtrProxyServer instance = BtrProxyServer._();
@@ -52,6 +65,9 @@ class BtrProxyServer {
   Future<void>? _stopping;
   Future<int>? _starting;
   final Set<CancellationToken> _activeTokens = {};
+  final Set<_SeekRoundHandle> _activeSeekRounds = {};
+  final Map<String, Set<CancellationToken>> _activeTrackTokens = {};
+  final Set<CancellationToken> _seekPendingTokens = {};
   final Map<String, CdnPool> _cdnPoolCache = {};
   final Set<String> _rangeUnsupportedUrls = {};
   final Map<String, MultiRangeDownloader> _downloaderCache = {};
@@ -409,6 +425,73 @@ class BtrProxyServer {
     currentVideoBitrateBytesPerSec = null;
   }
 
+  /// R5-B：视频 seek 协同钩子。
+  ///
+  /// 通过 [CancellationToken] 取消未完成的在途分块请求与排队等待项：
+  /// - 已完成并顺序写出到下游的分块保持不动；
+  /// - 不清 [_totalLengthCache] / [SidxCache] / [_cdnPoolCache]；
+  /// - 不停服务，不改变 [CdnPool] 单/多连接模式判定，不依赖 Pref。
+  void notifySeek([Duration? target]) {
+    if (_server == null) {
+      return;
+    }
+    for (final reqToken in _activeTokens) {
+      if (!reqToken.isCancelled) {
+        _seekPendingTokens.add(reqToken);
+      }
+    }
+    final rounds = List.of(_activeSeekRounds);
+    for (final round in rounds) {
+      try {
+        round.cancelForSeek();
+      } catch (_) {}
+    }
+    for (final downloader in _downloaderCache.values) {
+      try {
+        downloader.cancelAll('Client seek');
+      } catch (_) {}
+    }
+    final targetDesc =
+        target != null ? '${target.inMilliseconds}ms' : 'unknown';
+    BtrLog.rateLimitedLog(
+      'notify_seek',
+      '[BTR] seek 协同: 目标=$targetDesc 取消在途轮次=${rounds.length} 活跃请求=${_activeTokens.length}',
+    );
+  }
+
+  /// R5-B：seek 取消在途轮次后，短暂等待播放器发出新 Range 请求取代旧连接；
+  /// 若播放器已重连或关闭旧连接则立即唤醒退出，若命中播放器内存缓存未重连则到期无缝续传。
+  Future<void> _waitSeekSupersedeOrResume(
+    CancellationToken requestToken, {
+    Duration window = const Duration(milliseconds: 350),
+  }) async {
+    if (requestToken.isCancelled) {
+      return;
+    }
+    final completer = Completer<void>();
+    void onCancel() {
+      if (!completer.isCompleted) {
+        completer.complete();
+      }
+    }
+
+    requestToken.addListener(onCancel);
+    final timer = Timer(window, () {
+      if (!completer.isCompleted) {
+        completer.complete();
+      }
+    });
+    try {
+      if (!requestToken.isCancelled) {
+        await completer.future;
+      }
+    } finally {
+      timer.cancel();
+      requestToken.removeListener(onCancel);
+      _seekPendingTokens.remove(requestToken);
+    }
+  }
+
   /// 生成供播放器（如 mpv）请求的本地 URL-safe 代理地址
   ///
   /// 原始目标地址使用 base64url 编码（去除末尾填充字符 '='），以保证其可以安全嵌入 edl:// 协议字符串中
@@ -554,8 +637,23 @@ class BtrProxyServer {
       '[BTR] 预算划分: 视频=${budget.videoBudget}, 音频=${budget.audioBudget}, 预留=${budget.rescueReserve}, 全局上限=${budget.videoBudget + budget.audioBudget + budget.rescueReserve}',
     );
 
+    final trackKey = '$targetUrl#$kind';
+    if (request.method == 'GET') {
+      final prevTokens = _activeTrackTokens[trackKey];
+      if (prevTokens != null && prevTokens.isNotEmpty) {
+        for (final prevToken in List.of(prevTokens)) {
+          if (_seekPendingTokens.remove(prevToken)) {
+            prevToken.cancel('Superseded by post-seek request');
+          }
+        }
+      }
+    }
+
     final token = CancellationToken();
     _activeTokens.add(token);
+    if (request.method == 'GET') {
+      (_activeTrackTokens[trackKey] ??= <CancellationToken>{}).add(token);
+    }
     final requestSw = Stopwatch()..start();
     bool bytesSent = false;
     Object? requestError;
@@ -565,10 +663,12 @@ class BtrProxyServer {
     // 监听客户端连接是否中断
     request.response.done.then((_) {
       sinkClosed = true;
+      _seekPendingTokens.remove(token);
       token.cancel('Client finished or closed socket');
       _activeTokens.remove(token);
     }, onError: (err) {
       sinkErrored = true;
+      _seekPendingTokens.remove(token);
       token.cancel('Client connection closed with error: $err');
       _activeTokens.remove(token);
     });
@@ -769,7 +869,6 @@ class BtrProxyServer {
       // A & D：处理 HEAD 请求，优先发真正 upstream HEAD 探测且开放式 Range 保留 end 为 null
       if (request.method == 'HEAD') {
         int? totalLength = _totalLengthCache[targetUrl];
-        int headEnd = 0;
         if (totalLength == null) {
           try {
             totalLength = await downloader.probeHeadFast(
@@ -789,7 +888,6 @@ class BtrProxyServer {
               token: token,
             );
             totalLength = probe.totalLength;
-            headEnd = probe.headEnd;
           }
           if (totalLength != null) {
             _totalLengthCache[targetUrl] = totalLength;
@@ -810,24 +908,31 @@ class BtrProxyServer {
           }
 
           final requestedEnd = httpRange.end;
-          final int effectiveEnd;
+          // R1-A（审查 03）：开放式 Range 且总长度未知时终点不可知，
+          // 绝不能退化成首块探测终点（会对播放器声明一个 64KB 的假区间）。
+          final int? effectiveEnd;
           if (requestedEnd != null) {
             effectiveEnd =
                 totalLength != null ? min(requestedEnd, totalLength - 1) : requestedEnd;
           } else {
-            effectiveEnd = totalLength != null ? totalLength - 1 : headEnd;
+            effectiveEnd = totalLength != null ? totalLength - 1 : null;
           }
-          final contentLength = effectiveEnd - httpRange.start + 1;
 
           request.response.statusCode = HttpStatus.partialContent;
-          request.response.headers.set(
-            HttpHeaders.contentRangeHeader,
-            'bytes ${httpRange.start}-$effectiveEnd/${totalLength ?? '*'}',
-          );
-          request.response.headers.set(
-            HttpHeaders.contentLengthHeader,
-            contentLength,
-          );
+          if (effectiveEnd != null) {
+            request.response.headers.set(
+              HttpHeaders.contentRangeHeader,
+              'bytes ${httpRange.start}-$effectiveEnd/${totalLength ?? '*'}',
+            );
+            if (totalLength != null) {
+              final contentLength = effectiveEnd - httpRange.start + 1;
+              request.response.headers.set(
+                HttpHeaders.contentLengthHeader,
+                contentLength,
+              );
+            }
+          }
+          // 终点或总长度未知：与 GET 路径一致，不声明 Content-Length；终点未知时亦不带 Content-Range
         } else {
           request.response.statusCode = HttpStatus.ok;
           if (totalLength != null) {
@@ -864,26 +969,41 @@ class BtrProxyServer {
       // 所以给它一个硬上限：超时就**先把响应头发出去**，再用纯数据透传补数据；
       // 只有拿到明确的上游错误状态（HttpException 等）才如实上报。
       StartupProbeResult? probeMaybe;
-      final probeToken = CancellationToken();
-      void onParentCancel() => probeToken.cancel(token.reason);
-      token.addListener(onParentCancel);
-      try {
-        probeMaybe = await downloader
-            .probeHead(
-              start: start,
-              end: requestedEnd,
-              pool: pool,
-              token: probeToken,
-            )
-            .timeout(RangeCore.firstResponseDeadline);
-      } catch (e) {
-        probeMaybe = null;
-      } finally {
-        token.removeListener(onParentCancel);
-        if (probeMaybe == null) {
-          probeToken.cancel('启动测速超时或未命中');
+      for (var seekProbeRetry = 0; seekProbeRetry < 2; seekProbeRetry++) {
+        token.throwIfCancelled();
+        final probeRound = _SeekRoundHandle();
+        _activeSeekRounds.add(probeRound);
+        void onParentCancel() => probeRound.token.cancel(token.reason);
+        token.addListener(onParentCancel);
+        try {
+          probeMaybe = await downloader
+              .probeHead(
+                start: start,
+                end: requestedEnd,
+                pool: pool,
+                token: probeRound.token,
+              )
+              .timeout(RangeCore.firstResponseDeadline);
+        } catch (e) {
+          probeMaybe = null;
+        } finally {
+          _activeSeekRounds.remove(probeRound);
+          token.removeListener(onParentCancel);
+          if (probeMaybe == null && !probeRound.token.isCancelled) {
+            probeRound.token.cancel('启动测速超时或未命中');
+          }
         }
+        if (probeMaybe != null) {
+          break;
+        }
+        token.throwIfCancelled();
+        if (!probeRound.abortedBySeek) {
+          break;
+        }
+        await _waitSeekSupersedeOrResume(token);
+        token.throwIfCancelled();
       }
+      token.throwIfCancelled();
 
       if (probeMaybe == null) {
         // 首响应超时，判定加速不可行，记录降级直连状态（对齐官方 page-hook.js:1074-1081 / 140-158）
@@ -1015,14 +1135,17 @@ class BtrProxyServer {
         return;
       }
 
-      final int effectiveEnd;
+      // R1-A（审查 03）：客户端开放式 Range（bytes=N-）或无 Range、且上游没给出总长度时，
+      // 区间终点未知 → effectiveEnd 保持 null，**绝不**退化成 probe.headEnd
+      // （旧逻辑会让下方 `probe.headEnd < effectiveEnd` 判 false，响应被截断在首块 64KB，
+      // 真机表现为播 1~2 秒戛然而止）。终点未知时改走首块之后的单连接顺序透传直到上游 EOF。
+      final int? effectiveEnd;
       if (requestedEnd != null) {
         effectiveEnd =
             totalLength != null ? min(requestedEnd, totalLength - 1) : requestedEnd;
       } else {
-        effectiveEnd = totalLength != null ? totalLength - 1 : probe.headEnd;
+        effectiveEnd = totalLength != null ? totalLength - 1 : null;
       }
-      final contentLength = effectiveEnd - start + 1;
 
       // 基于单连接实测速度与并发聚合吞吐进行自适应并发决策（已在 pool 记录则复用）
       final int adaptiveConcurrency;
@@ -1070,14 +1193,21 @@ class BtrProxyServer {
 
       if (httpRange != null) {
         request.response.statusCode = HttpStatus.partialContent;
-        request.response.headers.set(
-          HttpHeaders.contentRangeHeader,
-          'bytes $start-$effectiveEnd/${totalLength ?? '*'}',
-        );
-        request.response.headers.set(
-          HttpHeaders.contentLengthHeader,
-          contentLength,
-        );
+        if (effectiveEnd != null) {
+          request.response.headers.set(
+            HttpHeaders.contentRangeHeader,
+            'bytes $start-$effectiveEnd/${totalLength ?? '*'}',
+          );
+          if (totalLength != null) {
+            final contentLength = effectiveEnd - start + 1;
+            request.response.headers.set(
+              HttpHeaders.contentLengthHeader,
+              contentLength,
+            );
+          }
+        }
+        // R1-A：总长未知时不声明 Content-Length；开放式 Range 且总长未知时 effectiveEnd 为 null，
+        // 不带 Content-Range（避免非法头），保持 206 + chunked 顺序下发至 EOF。
       } else {
         request.response.statusCode = HttpStatus.ok;
         if (totalLength != null) {
@@ -1118,75 +1248,167 @@ class BtrProxyServer {
         }
       }
 
-      // 无 Range 和开放式 Range 统一采用流式下载（按 sidx 分段边界或回退等分）
-      if (probe.headEnd < effectiveEnd) {
+      // R1-A：终点未知（开放式 Range / 无 Range 且上游无总长度）→ 首块已写出，
+      // 从 probe.headEnd + 1 起单连接顺序透传（上游 Range: bytes=N-），
+      // 由 _streamDirect → _streamBodyWithStallWatchdog 的读循环一直读到上游 EOF；
+      // 此时 maxBytes == null，onDone 即正常结束（见 R1-B 说明）。
+      if (effectiveEnd == null) {
         final remainingStart = probe.headEnd + 1;
-        List<RangePiece>? pieces;
-        final sidx = SidxCache.get(urlKey);
-        if (sidx != null && sidx.segments.isNotEmpty) {
-          final sidxPieces = SidxParser.planSegmentAlignedPieces(
-            sidx.segments,
-            remainingStart,
-            effectiveEnd,
-            maxPieceBytes: RangeCore.defaultMaxPieceBytes,
+        BtrLog.rateLimitedLog(
+          'open_ended_unknown_total_${targetUrl.hashCode}',
+          '[BTR] 开放式请求且总长度未知 → 首块后单连接顺序透传至 EOF: '
+          '节点=${BtrLog.hostOf(probe.winningUrl)} 起点=$remainingStart',
+        );
+        // 记录首块之后是否已有透传字节写出：416 只有在「一个尾部字节都还没写」时才可视为 EOF
+        var tailBytesSent = false;
+        try {
+          await _streamDirect(
+            clientRequest: request,
+            targetUrl: probe.winningUrl,
+            token: token,
+            defaultHeaders: headers,
+            fromOffset: remainingStart,
+            onByteSent: () {
+              tailBytesSent = true;
+              onFirstBytesSent();
+            },
+            onSinkError: () => sinkErrored = true,
+            downloader: downloader,
+            pool: pool,
           );
-          if (sidxPieces.isNotEmpty) {
-            pieces = sidxPieces;
+        } on UpstreamHttpException catch (e) {
+          // 只有「尚未写出任何尾部字节 + 上游回 416」代表首块已经覆盖到文件末尾、后面没有字节了，
+          // 属于正常 EOF；其它情况（含续拉阶段的 416）一律原样上抛，由外层 catch 按传输中途出错硬断。
+          if (tailBytesSent ||
+              e.statusCode != HttpStatus.requestedRangeNotSatisfiable) {
+            rethrow;
+          }
+          BtrLog.rateLimitedLog(
+            'open_ended_head_is_eof_${targetUrl.hashCode}',
+            '[BTR] 开放式透传: 上游对起点=$remainingStart 回 416，首块即文件末尾，正常结束: '
+            '节点=${BtrLog.hostOf(probe.winningUrl)}',
+          );
+        }
+      } else if (probe.headEnd < effectiveEnd) {
+        // 无 Range 和开放式 Range（总长度已知）统一采用流式下载（按 sidx 分段边界或回退等分）
+        // R5-B：以子轮次 _SeekRoundHandle 隔离 seek 取消信号，notifySeek 仅取消未完成在途分块，
+        // 已完成并顺序写出至下游的字节（probe.headEnd + 1 .. nextResumeOffset - 1）保持不动。
+        var nextResumeOffset = probe.headEnd + 1;
+        Future<void> pendingDownstreamFlush = Future.value();
+        while (nextResumeOffset <= effectiveEnd) {
+          token.throwIfCancelled();
+          if (sinkErrored ||
+              sinkClosed ||
+              _terminatedResponses[request.response] == true) {
+            break;
+          }
+
+          final remainingStart = nextResumeOffset;
+          List<RangePiece>? pieces;
+          final sidx = SidxCache.get(urlKey);
+          if (sidx != null && sidx.segments.isNotEmpty) {
+            final sidxPieces = SidxParser.planSegmentAlignedPieces(
+              sidx.segments,
+              remainingStart,
+              effectiveEnd,
+              maxPieceBytes: RangeCore.defaultMaxPieceBytes,
+            );
+            if (sidxPieces.isNotEmpty) {
+              pieces = sidxPieces;
+              BtrLog.rateLimitedLog(
+                'sidx_plan_$urlKey',
+                '[BTR] 按分段边界规划 ${pieces.length} 段: host=${BtrLog.hostOf(targetUrl)}',
+              );
+            }
+          }
+          if (pieces == null || pieces.isEmpty) {
             BtrLog.rateLimitedLog(
-              'sidx_plan_$urlKey',
-              '[BTR] 按分段边界规划 ${pieces.length} 段: host=${BtrLog.hostOf(targetUrl)}',
+              'sidx_fallback_$urlKey',
+              '[BTR] sidx 不可用 → 回退等分: host=${BtrLog.hostOf(targetUrl)}',
+            );
+            pieces = RangeCore.splitRange(
+              remainingStart,
+              effectiveEnd,
+              maxPieceBytes: RangeCore.defaultMaxPieceBytes,
             );
           }
-        }
-        if (pieces == null || pieces.isEmpty) {
-          BtrLog.rateLimitedLog(
-            'sidx_fallback_$urlKey',
-            '[BTR] sidx 不可用 → 回退等分: host=${BtrLog.hostOf(targetUrl)}',
-          );
-          pieces = RangeCore.splitRange(
-            remainingStart,
-            effectiveEnd,
-            maxPieceBytes: RangeCore.defaultMaxPieceBytes,
-          );
-        }
 
-        if (pieces.isNotEmpty) {
+          if (pieces.isEmpty) {
+            break;
+          }
+
           final effectiveV1 = probe.bps > 0
               ? probe.bps
               : (pool.getSpeed(probe.winningUrl) ?? 0.0);
+          final roundConcurrency = pool.isSingleConnectionMode
+              ? 1
+              : (pool.adaptiveConcurrency ?? adaptiveConcurrency);
+          final pieceRound = _SeekRoundHandle();
+          _activeSeekRounds.add(pieceRound);
+          void onParentCancel() => pieceRound.token.cancel(token.reason);
+          token.addListener(onParentCancel);
 
-          await downloader.streamPieces(
-            pieces: pieces,
-            pool: pool,
-            token: token,
-            winningUrl: probe.winningUrl,
-            concurrency: adaptiveConcurrency,
-            maxInFlightSockets: maxSockets,
-            v1Bps: effectiveV1,
-            originalThreads: allocatedThreads,
-            kind: kind,
-            onOrderedChunk: (chunk) async {
-              if (sinkErrored ||
-                  sinkClosed ||
-                  _terminatedResponses[request.response] == true) {
-                BtrLog.log(
-                  '[BTR] 下游写入冲突(已防御): 场景=向已关闭/已报错下游sink推入并发分块',
-                );
-                return;
-              }
-              try {
-                request.response.add(chunk);
-                await request.response.flush();
-                onFirstBytesSent();
-              } catch (e) {
-                sinkErrored = true;
-                BtrLog.log(
-                  '[BTR] 下游写入冲突(已防御): 场景=并发分块写入抛错: ${BtrLog.redact(e)}',
-                );
-                rethrow;
-              }
-            },
-          );
+          try {
+            await downloader.streamPieces(
+              pieces: pieces,
+              pool: pool,
+              token: pieceRound.token,
+              winningUrl: probe.winningUrl,
+              concurrency: roundConcurrency,
+              maxInFlightSockets: maxSockets,
+              v1Bps: effectiveV1,
+              originalThreads: allocatedThreads,
+              kind: kind,
+              onOrderedChunk: (chunk) async {
+                if (pieceRound.token.isCancelled || token.isCancelled) {
+                  return;
+                }
+                if (sinkErrored ||
+                    sinkClosed ||
+                    _terminatedResponses[request.response] == true) {
+                  BtrLog.log(
+                    '[BTR] 下游写入冲突(已防御): 场景=向已关闭/已报错下游sink推入并发分块',
+                  );
+                  return;
+                }
+                try {
+                  request.response.add(chunk);
+                  nextResumeOffset += chunk.length;
+                  final flushFuture = request.response.flush();
+                  pendingDownstreamFlush = flushFuture.catchError((_) {});
+                  await flushFuture;
+                  onFirstBytesSent();
+                } catch (e) {
+                  sinkErrored = true;
+                  BtrLog.log(
+                    '[BTR] 下游写入冲突(已防御): 场景=并发分块写入抛错: ${BtrLog.redact(e)}',
+                  );
+                  rethrow;
+                }
+              },
+            );
+            break;
+          } on CancellationException {
+            if (token.isCancelled || !pieceRound.abortedBySeek) {
+              rethrow;
+            }
+            await pendingDownstreamFlush;
+            await _waitSeekSupersedeOrResume(token);
+            token.throwIfCancelled();
+            if (sinkErrored ||
+                sinkClosed ||
+                _terminatedResponses[request.response] == true) {
+              break;
+            }
+            BtrLog.rateLimitedLog(
+              'seek_in_cache_resume_$kind',
+              '[BTR] seek 命中播放器缓存未重连($kind) → 从 offset=$nextResumeOffset 续传至 $effectiveEnd: '
+              'host=${BtrLog.hostOf(targetUrl)}',
+            );
+          } finally {
+            _activeSeekRounds.remove(pieceRound);
+            token.removeListener(onParentCancel);
+          }
         }
       }
     } on RangeNotSupportedException catch (e) {
@@ -1271,6 +1493,14 @@ class BtrProxyServer {
         activePool.isRetakeoverInProgress = false;
       }
       // 统一唯一收尾责任处，由 _terminateResponse 保证严格幂等
+      _seekPendingTokens.remove(token);
+      final trackTokens = _activeTrackTokens[trackKey];
+      if (trackTokens != null) {
+        trackTokens.remove(token);
+        if (trackTokens.isEmpty) {
+          _activeTrackTokens.remove(trackKey);
+        }
+      }
       _activeTokens.remove(token);
       final hasError = requestError != null || token.isCancelled;
       if (hasError && bytesSent) {
@@ -1858,11 +2088,21 @@ class BtrProxyServer {
       }
 
       if (upstreamResp.statusCode >= 400) {
+        try {
+          upstreamReq.abort();
+        } catch (_) {}
         throw UpstreamHttpException(
           upstreamResp.statusCode,
           '已发送响应头后上游仍返回错误',
           uri: uri,
         );
+      }
+
+      if (effectiveBase > 0 && upstreamResp.statusCode == HttpStatus.ok) {
+        try {
+          upstreamReq.abort();
+        } catch (_) {}
+        throw const RangeNotSupportedException('已发送部分数据后上游忽略 Range 返回 200');
       }
 
       await _streamBodyWithStallWatchdog(
@@ -1986,6 +2226,8 @@ class BtrProxyServer {
         token.throwIfCancelled();
 
         bool isStalled = false;
+        // R1-B：本轮是否因「上游提前 FIN（字节没给够）」而被转成停滞续拉
+        bool isPrematureEof = false;
         final roundCompleter = Completer<void>();
         activeRoundCompleter = roundCompleter;
         bool isDone = false;
@@ -2106,9 +2348,28 @@ class BtrProxyServer {
           },
           onDone: () async {
             isDone = true;
+            // 上游已收尾，本轮不再需要停滞计时器；先取消，避免它在下面等待 writeChain 期间
+            // 触发而与本回调重复判定同一轮（同一轮只允许一个出口决定是否续拉）。
+            stallTimer?.cancel();
             try {
               await writeChain;
             } catch (_) {}
+            // R1-B（审查 04）：已对下游声明了区间长度（maxBytes != null）但实际写入不足 →
+            // 上游 CDN 提前主动 FIN，不能当正常结束（播放器会 EOF 报错/卡死），
+            // 转入下方已有的停滞续拉分支：resumeOffset = baseOffset + written、stallRetries 递增、
+            // 超过 maxStallRetries 才放弃。written 只在 safeWriteChunk 真正写出后才累加，
+            // 且此处已等待 writeChain 排空，故续拉起点恰为下一个未写字节，不会重复写。
+            // maxBytes == null（总长未知的透传）保持原行为：onDone 即正常结束。
+            // 下游已报错/已收尾时不续拉（字节没写出去是下游原因，不是上游断流）。
+            if (maxBytes != null &&
+                written < maxBytes &&
+                !earlyExit &&
+                !cancelledByUs &&
+                !isSinkErrored &&
+                _terminatedResponses[clientRequest.response] != true) {
+              isPrematureEof = true;
+              isStalled = true;
+            }
             if (!roundCompleter.isCompleted) {
               roundCompleter.complete();
             }
@@ -2144,13 +2405,19 @@ class BtrProxyServer {
           final resumeOffset = baseOffset + written;
 
           if (stallRetries > maxStallRetries) {
-            BtrLog.log('[BTR] 直连停滞放弃: 连续 3 次无数据，已断开本次响应');
+            BtrLog.log(
+              isPrematureEof
+                  ? '[BTR] 直连续拉放弃: 上游提前断流（已写 $written/$maxBytes 字节），停滞/断流续拉已超 $maxStallRetries 次，已断开本次响应'
+                  : '[BTR] 直连停滞放弃: 连续 3 次无数据，已断开本次响应',
+            );
             await _terminateResponse(clientRequest.response, force: true);
             break;
           }
 
           BtrLog.log(
-            '[BTR] 直连停滞 ${stallMs}ms 无数据 → 从 offset=$resumeOffset 续拉（第 $stallRetries/$maxStallRetries 次）',
+            isPrematureEof
+                ? '[BTR] 直连上游提前断流（已写 $written/$maxBytes 字节）→ 从 offset=$resumeOffset 续拉（第 $stallRetries/$maxStallRetries 次）'
+                : '[BTR] 直连停滞 ${stallMs}ms 无数据 → 从 offset=$resumeOffset 续拉（第 $stallRetries/$maxStallRetries 次）',
           );
 
           await Future.delayed(const Duration(milliseconds: 500));

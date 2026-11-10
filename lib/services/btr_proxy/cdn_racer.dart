@@ -171,38 +171,11 @@ class CdnRacer {
   /// 最近一次竞速整批下载的总字节数
   int lastTotalSampleBytes = 0;
 
-  /// 官方大陆节点集合
-  static const Set<String> mainlandHosts = {
-    'upos-sz-mirrorali.bilivideo.com',
-    'upos-sz-mirrorhw.bilivideo.com',
-    'upos-sz-mirrorbos.bilivideo.com',
-    'upos-sz-mirror08c.bilivideo.com',
-    'upos-sz-mirrorbd.bilivideo.com',
-    'upos-sz-mirror14b.bilivideo.com',
-    'upos-sz-estgoss.bilivideo.com',
-    'upos-sz-mirrorcos.bilivideo.com',
-    'upos-sz-mirroralib.bilivideo.com',
-    'upos-sz-mirroralio1.bilivideo.com',
-    'upos-sz-mirrorcosb.bilivideo.com',
-    'upos-sz-mirrorcoso1.bilivideo.com',
-    'upos-sz-mirrorhwb.bilivideo.com',
-    'upos-sz-mirrorhwo1.bilivideo.com',
-    'upos-sz-mirror08h.bilivideo.com',
-    'upos-sz-mirror08ct.bilivideo.com',
-    'upos-tf-all-hw.bilivideo.com',
-    'upos-tf-all-tx.bilivideo.com',
-  };
+  /// 官方大陆节点集合（单点维护于 RangeCore.mainlandHosts）
+  static const Set<String> mainlandHosts = RangeCore.mainlandHosts;
 
-  /// 官方海外节点集合
-  static const Set<String> overseasHosts = {
-    'upos-sz-mirrorcosov.bilivideo.com',
-    'upos-sz-mirroraliov.bilivideo.com',
-    'cn-hk-eq-01-01.bilivideo.com',
-    'cn-hk-eq-01-03.bilivideo.com',
-    'upos-sz-mirrorhwov.bilivideo.com',
-    'cn-hk-eq-bcache-01.bilivideo.com',
-    'upos-hz-mirrorakam.akamaized.net',
-  };
+  /// 官方海外节点集合（单点维护于 RangeCore.overseasHosts）
+  static const Set<String> overseasHosts = RangeCore.overseasHosts;
 
   CdnRacer({
     this.ttlMs = 300000,
@@ -248,6 +221,14 @@ class CdnRacer {
     return lower == 'akamaized.net' || lower.endsWith('.akamaized.net');
   }
 
+  /// 判断 host 是否属于海外节点（含海外清单与所有 Akamai 域名，确保 Akamai 绝不落入大陆判定）
+  static bool isOverseasHost(String host) {
+    final lower = host.contains(':')
+        ? host.split(':').first.toLowerCase()
+        : host.toLowerCase();
+    return overseasHosts.contains(lower) || isAkamaiHost(lower);
+  }
+
   /// 裁剪候选节点：按 group 过滤、去拉黑、截取前 maxCandidates
   List<String> filterCandidates({
     required List<String> candidates,
@@ -267,31 +248,19 @@ class CdnRacer {
     List<String> groupFiltered;
     if (group == 'overseas') {
       final nonAkamai = notBanned.where((c) => !isAkamaiHost(c)).toList();
-      final overseasOnly = nonAkamai.where((c) {
-        final host = c.contains(':')
-            ? c.split(':').first.toLowerCase()
-            : c.toLowerCase();
-        return overseasHosts.contains(host);
-      }).toList();
+      final overseasOnly = nonAkamai.where(isOverseasHost).toList();
       groupFiltered = overseasOnly.isNotEmpty ? overseasOnly : nonAkamai;
     } else if (group == 'mainland') {
-      final mainlandOnly = notBanned.where((c) {
-        final host = c.contains(':')
-            ? c.split(':').first.toLowerCase()
-            : c.toLowerCase();
-        return !overseasHosts.contains(host);
-      }).toList();
-      groupFiltered = mainlandOnly.isNotEmpty ? mainlandOnly : notBanned;
+      final nonAkamai = notBanned.where((c) => !isAkamaiHost(c)).toList();
+      final mainlandOnly = nonAkamai.where((c) => !isOverseasHost(c)).toList();
+      groupFiltered = mainlandOnly.isNotEmpty ? mainlandOnly : nonAkamai;
     } else {
       // auto 分支：跳过 Akamai，保证两组都有代表，按「海外组 1 个、大陆组 1 个」交替各取
       final nonAkamai = notBanned.where((c) => !isAkamaiHost(c)).toList();
       final overseas = <String>[];
       final mainland = <String>[];
       for (final c in nonAkamai) {
-        final host = c.contains(':')
-            ? c.split(':').first.toLowerCase()
-            : c.toLowerCase();
-        if (overseasHosts.contains(host)) {
+        if (isOverseasHost(c)) {
           overseas.add(c);
         } else {
           mainland.add(c);
